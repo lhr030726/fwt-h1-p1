@@ -42,6 +42,10 @@ def parse_args(argv=None):
     parser.add_argument('--max-memory-fraction', type=float, default=.85)
     parser.add_argument('--gpu-atol', type=float, default=0.)
     parser.add_argument('--gpu-rtol', type=float, default=0.)
+    parser.add_argument('--deterministic-gpu', action='store_true',
+                        help='Explicit diagnostic control; does not change the training entrypoint')
+    parser.add_argument('--synthetic-repeat-diagnostic', action='store_true',
+                        help='Two uncached H1 arms on synthetic inputs; no data access or witness pass')
     parser.add_argument('--execute', action='store_true')
     args = parser.parse_args(argv)
     if not 1 <= args.cpu_threads <= 32 or args.device_index < 0 or not 1 <= args.cache_mib <= 1024:
@@ -52,7 +56,32 @@ def parse_args(argv=None):
         parser.error('max-memory-fraction must be in (0, 0.95]')
     if any(not math.isfinite(value) or value < 0 for value in (args.gpu_atol, args.gpu_rtol)):
         parser.error('GPU tolerances must be finite and nonnegative')
+    if args.synthetic_repeat_diagnostic and (args.gpu_atol or args.gpu_rtol):
+        parser.error('Repeat diagnostics report exact differences; do not specify a passing tolerance')
     return args
+
+
+def configure_gpu_mode(args, torch):
+    """Configure explicit deterministic controls before the first CUDA context."""
+    initialized = torch.cuda.is_initialized()
+    previous = os.environ.get('CUBLAS_WORKSPACE_CONFIG')
+    if args.deterministic_gpu:
+        if initialized:
+            raise RuntimeError('Deterministic GPU controls require a fresh process before CUDA initialization')
+        os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+        torch.use_deterministic_algorithms(True, warn_only=False)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    return dict(requested_deterministic_gpu=args.deterministic_gpu,
+        cuda_initialized_before_settings=initialized,
+        previous_cublas_workspace_config=previous,
+        cublas_workspace_config=os.environ.get('CUBLAS_WORKSPACE_CONFIG'),
+        deterministic_algorithms=torch.are_deterministic_algorithms_enabled(),
+        deterministic_warn_only=torch.is_deterministic_algorithms_warn_only_enabled(),
+        cudnn_deterministic=torch.backends.cudnn.deterministic,
+        cudnn_benchmark=torch.backends.cudnn.benchmark,
+        cudnn_allow_tf32=torch.backends.cudnn.allow_tf32,
+        matmul_allow_tf32=torch.backends.cuda.matmul.allow_tf32)
 
 
 def blocked_process_state(pid):
@@ -161,6 +190,54 @@ def rng_snapshot(torch, np, device):
                 torch_cpu=torch.get_rng_state(), torch_cuda=torch.cuda.get_rng_state(device))
 
 
+def diagnose_differences(expected, actual, torch, path='root'):
+    """Describe every floating difference, never convert a difference to a pass.
+
+    Exact integer/RNG/identity mismatches and nonfinite tensors invalidate the
+    repeat control. Floating differences retain their own per-tensor magnitude.
+    """
+    if isinstance(expected, torch.Tensor):
+        if not isinstance(actual, torch.Tensor) or expected.shape != actual.shape or expected.dtype != actual.dtype:
+            raise AssertionError('Diagnostic tensor metadata mismatch at ' + path)
+        try:
+            compare(expected, actual, torch, path=path)
+            return dict(tensors=1, differences=[])
+        except AssertionError:
+            if not expected.is_floating_point():
+                raise
+        a, b = expected.detach().cpu().double(), actual.detach().cpu().double()
+        if not bool(torch.isfinite(a).all() and torch.isfinite(b).all()):
+            raise AssertionError('Nonfinite diagnostic tensor at ' + path)
+        delta = a - b
+        norm = float(torch.linalg.vector_norm(a))
+        difference_norm = float(torch.linalg.vector_norm(delta))
+        return dict(tensors=1, differences=[dict(path=path, shape=list(a.shape), dtype=str(expected.dtype),
+            max_absolute_difference=float(delta.abs().max()) if a.numel() else 0.,
+            differing_values=int(torch.count_nonzero(delta)), reference_l2=norm,
+            difference_l2=difference_norm,
+            relative_l2=difference_norm / norm if norm else (0. if not difference_norm else None))])
+    if type(expected) is not type(actual):
+        raise AssertionError('Diagnostic container/scalar type mismatch at ' + path)
+    if isinstance(expected, dict):
+        if expected.keys() != actual.keys():
+            raise AssertionError('Diagnostic dictionary key mismatch at ' + path)
+        pairs = [(key, expected[key], actual[key]) for key in expected]
+    elif isinstance(expected, (list, tuple)):
+        if len(expected) != len(actual):
+            raise AssertionError('Diagnostic sequence length mismatch at ' + path)
+        pairs = [(index, a, b) for index, (a, b) in enumerate(zip(expected, actual))]
+    else:
+        if expected != actual:
+            raise AssertionError('Diagnostic scalar/identity mismatch at ' + path)
+        return dict(tensors=0, differences=[])
+    result = dict(tensors=0, differences=[])
+    for key, a, b in pairs:
+        item = diagnose_differences(a, b, torch, path=f'{path}.{key}')
+        result['tensors'] += item['tensors']
+        result['differences'].extend(item['differences'])
+    return result
+
+
 def run_arm(args, config, data_config, dataset, indices, phase, device, expected=None):
     import numpy as np
     import torch
@@ -187,6 +264,9 @@ def run_arm(args, config, data_config, dataset, indices, phase, device, expected
         head = ConditionalResidualDiffusion(DiffusionConfig(**settings)).to(device)
     model = backbone if head is None else head
     model.train()
+    module_types = {name: type(module).__name__ for name, module in model.named_modules()}
+    parameter_modules = {name: module_types[name.rsplit('.', 1)[0]]
+                         for name, _ in model.named_parameters() if '.' in name}
     initial_digest = model_state_digest(model)
     frozen_digest = model_state_digest(backbone) if head is not None else None
     optimizer = torch.optim.AdamW(model.parameters(), lr=.001)
@@ -310,6 +390,7 @@ def run_arm(args, config, data_config, dataset, indices, phase, device, expected
         if not all(frozen.values()):
             raise RuntimeError('P1 random backbone was not frozen')
     result = dict(updates=records, prediction=prediction, adamw_changed_model=changed,
+                  parameter_modules=parameter_modules,
                   initial_model_sha256=initial_digest, final_model_sha256=model_state_digest(model),
                   frozen_backbone=frozen, peak_allocated_bytes=torch.cuda.max_memory_allocated(device),
                   peak_reserved_bytes=torch.cuda.max_memory_reserved(device), cpu_memory=memory_snapshot(),
@@ -320,11 +401,79 @@ def run_arm(args, config, data_config, dataset, indices, phase, device, expected
     return result, private_states
 
 
+def execute_synthetic_diagnostic(args, report, save):
+    """Reuse the complete H1 update path, with synthetic inputs and no cache."""
+    if sys.platform != 'linux':
+        raise RuntimeError('Run the GPU diagnostic in the configured Linux environment')
+    require_no_jobs(args)
+    import torch
+    from benchmark_batches import synthetic_batch
+    from fwt_v2.data import DataConfig
+    from fwt_v2.portable import read_json, file_sha256
+
+    controls = configure_gpu_mode(args, torch)  # Before any CUDA availability/device call.
+    torch.set_num_threads(args.cpu_threads)
+    config_path = ROOT / 'configs/h1.json'
+    config = read_json(config_path)
+    report['provenance'] = dict(config_sha256=file_sha256(config_path), config=config,
+        script_sha256=file_sha256(__file__),
+        sources={p.name: file_sha256(p) for p in sorted((ROOT / 'fwt_v2').glob('*.py'))},
+        helper_sha256={name: file_sha256(ROOT / 'scripts' / name) for name in
+                       ('benchmark_batches.py', 'benchmark_sample_cache.py')})
+    report['environment'] = dict(torch=torch.__version__, python=sys.version,
+        cuda=torch.version.cuda, cpu_threads=torch.get_num_threads(), gpu_controls=controls)
+    save()
+    if not torch.cuda.is_available() or args.device_index >= torch.cuda.device_count():
+        raise RuntimeError('Configured CUDA device unavailable')
+    device = torch.device(f'cuda:{args.device_index}')
+    torch.cuda.set_device(device)
+    torch.cuda.set_per_process_memory_fraction(args.max_memory_fraction, device)
+    report['environment']['gpu_name'] = torch.cuda.get_device_name(device)
+    dataset = []
+    for index in range(args.updates):
+        batch = synthetic_batch(torch, 1, 256, 256,
+            18 + config['model']['extra_weather_channels'], args.seed + index, 'cpu')
+        sample = {name: value[0] for name, value in batch.items() if name != 'physics'}
+        sample['physics'] = {name: value[0] for name, value in batch['physics'].items()}
+        sample['sample_id'] = f'SYNTHETIC-REPEAT-{index}'
+        dataset.append(sample)
+    del batch, sample
+    phase = dict(phase='det', role='synthetic_no_role', arms={}, status='running')
+    report['phases'].append(phase)
+    indices = list(range(args.updates))
+    phase['arms']['uncached_a'], reference = run_arm(
+        args, config, DataConfig(**config['data']), dataset, indices, 'det', device)
+    save()
+    # No expected-state argument: collect the whole repeat before measuring all
+    # differences, rather than stopping at the first nondeterministic gradient.
+    phase['arms']['uncached_b'], repeated = run_arm(
+        args, config, DataConfig(**config['data']), dataset, indices, 'det', device)
+    if phase['arms']['uncached_a']['initial_model_sha256'] != phase['arms']['uncached_b']['initial_model_sha256']:
+        raise AssertionError('Synthetic repeat initial models differ')
+    comparison = diagnose_differences(reference, repeated, torch)
+    owners = phase['arms']['uncached_a']['parameter_modules']
+    for difference in comparison['differences']:
+        if '.gradients.' in difference['path']:
+            parameter = difference['path'].split('.gradients.', 1)[1]
+            difference['parameter_module_type'] = owners.get(parameter)
+    comparison['different_tensors'] = len(comparison['differences'])
+    comparison['repeat_bitwise_equal'] = not comparison['differences']
+    comparison['interpretation'] = ('No tensor difference observed in this bounded repeat.'
+        if comparison['repeat_bitwise_equal'] else
+        'Differences occurred without any cache; this is native execution repeatability evidence, not a cache equivalence pass.')
+    comparison['attribution_limit'] = ('A differing parameter identifies an affected module, not the originating kernel. '
+        'upsamples.*.up.1 is Conv2d; the preceding F.interpolate uses bilinear align_corners=True.')
+    phase.update(status='diagnostic_completed', comparison=comparison)
+    report.update(status='diagnostic_completed', witness_passed=False,
+                  cpu_memory_after=memory_snapshot())
+
+
 def execute(args, report, save):
     if sys.platform != 'linux':
         raise RuntimeError('Execute this witness in the configured Linux GPU environment')
     require_no_jobs(args)  # Before torch import or expensive data verification.
     import torch
+    controls = configure_gpu_mode(args, torch)
     import train as portable_train
     from fwt_v2.data import DataConfig, NormalizationStats, RCDADataset
     from fwt_v2.portable import read_json, file_sha256
@@ -348,7 +497,7 @@ def execute(args, report, save):
         config=config, role_counts=checked['role_counts'])
     report['metadata_preflight_seconds'] = time.perf_counter() - started
     report['environment'] = dict(torch=torch.__version__, python=sys.version,
-        cuda=torch.version.cuda, cpu_threads=torch.get_num_threads())
+        cuda=torch.version.cuda, cpu_threads=torch.get_num_threads(), gpu_controls=controls)
     save()
     normalizer = NormalizationStats.load(checked['normalizer'])
     data_config = DataConfig(**config['data'])
@@ -430,7 +579,8 @@ def main(argv=None):
         checkpoint_reads=0, checkpoint_writes=0, training_outputs_created=0,
         cpu_sample_comparison='bitwise structural SHA256, including every tensor and metadata scalar',
         gpu_tolerance=dict(atol=args.gpu_atol, rtol=args.gpu_rtol),
-        precision='FP32; inherited PyTorch TF32/determinism defaults',
+        deterministic_gpu_requested=args.deterministic_gpu,
+        precision='FP32; explicit deterministic controls' if args.deterministic_gpu else 'FP32; inherited PyTorch defaults',
         protocol='first/last declared Tb and Tr samples; identical fixed order, RNG, and AdamW lr=0.001',
         prediction_protocol='first selected Tb/Tr sample; original raw_probability; P1 K=8, steps=4, DDIM and sample-ID seed',
         limitations=['Random temporary weights do not measure training quality or checkpoint compatibility.',
@@ -439,6 +589,20 @@ def main(argv=None):
             'Prediction checks reuse selected Tb/Tr samples; no validation/test arrays, selection, resume, or checkpoints.',
             'Step timings include diagnostic hooks; do not interpret as throughput benchmark.',
             'GPU allocator peaks exclude driver/context memory; CPU RSS peak is process cumulative.'])
+    if args.synthetic_repeat_diagnostic:
+        report.update(schema='fwt_synthetic_repeat_diagnostic_v1',
+            purpose='native GPU repeatability diagnostic; no cache equivalence or scientific result',
+            data_root=None, data_reads=0, cache_enabled=False, cache_mib=0,
+            protocol='two fresh H1 models, same seed, same synthetic batch-1 inputs and update sequence',
+            witness_passed=False,
+            gpu_tolerance=None,
+            cpu_sample_comparison='same synthetic input bytes; no RCDADataset or source verification required',
+            prediction_protocol='one synthetic sample through original H1 raw_probability after each arm',
+            limitations=['Synthetic-only H1 repeat; no real data, P1, cache, validation, or training-quality evidence.',
+                'A parameter-gradient difference does not identify the originating kernel.',
+                'Deterministic GPU controls affect this disposable diagnostic only; unsupported operators fail explicitly.',
+                'diagnostic_completed means observations collected, never a passing cache-equivalence witness.',
+                'GPU allocator peaks exclude driver/context memory.'])
     if not args.execute:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
@@ -459,7 +623,8 @@ def main(argv=None):
                                      for p in report['phases']])), flush=True)
 
     try:
-        execute(args, report, save)
+        action = execute_synthetic_diagnostic if args.synthetic_repeat_diagnostic else execute
+        action(args, report, save)
     except BaseException as exc:
         report.update(status='failed', error_type=type(exc).__name__, error=str(exc))
         raise

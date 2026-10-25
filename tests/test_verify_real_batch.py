@@ -14,6 +14,22 @@ SPEC.loader.exec_module(witness)
 
 
 class RealBatchWitnessTests(unittest.TestCase):
+    @staticmethod
+    def fake_torch_controls(initialized=False):
+        settings = dict(deterministic=False, warn_only=False, calls=[])
+        def enable(value, *, warn_only):
+            if witness.os.environ.get('CUBLAS_WORKSPACE_CONFIG') != ':4096:8':
+                raise AssertionError('cuBLAS environment was not set before deterministic controls')
+            settings.update(deterministic=value, warn_only=warn_only)
+            settings['calls'].append('deterministic_controls')
+        fake = SimpleNamespace(cuda=SimpleNamespace(is_initialized=lambda: initialized),
+            use_deterministic_algorithms=enable,
+            are_deterministic_algorithms_enabled=lambda: settings['deterministic'],
+            is_deterministic_algorithms_warn_only_enabled=lambda: settings['warn_only'],
+            backends=SimpleNamespace(cudnn=SimpleNamespace(deterministic=False, benchmark=True, allow_tf32=True),
+                cuda=SimpleNamespace(matmul=SimpleNamespace(allow_tf32=False))))
+        return fake, settings
+
     def test_default_is_plan_without_data_gpu_or_torch(self):
         with patch.object(witness, 'require_no_jobs', side_effect=AssertionError('GPU touched')), \
                 patch.object(witness, 'execute', side_effect=AssertionError('execution called')), \
@@ -26,6 +42,49 @@ class RealBatchWitnessTests(unittest.TestCase):
         self.assertEqual(plan['batch_size'], 1)
         self.assertEqual(plan['gpu_tolerance'], dict(atol=0., rtol=0.))
         self.assertEqual(plan['checkpoint_reads'], 0)
+
+    def test_synthetic_diagnostic_plan_never_executes_or_claims_witness_pass(self):
+        with patch.object(witness, 'require_no_jobs', side_effect=AssertionError('GPU touched')), \
+                patch.object(witness, 'execute_synthetic_diagnostic', side_effect=AssertionError('executed')), \
+                patch('builtins.print') as printed:
+            witness.main(['--synthetic-repeat-diagnostic', '--deterministic-gpu'])
+        plan = json.loads(printed.call_args.args[0])
+        self.assertEqual(plan['schema'], 'fwt_synthetic_repeat_diagnostic_v1')
+        self.assertEqual(plan['status'], 'plan_only')
+        self.assertEqual(plan['data_reads'], 0)
+        self.assertFalse(plan['witness_passed'])
+        self.assertFalse(plan['cache_enabled'])
+        self.assertTrue(plan['deterministic_gpu_requested'])
+
+    def test_deterministic_controls_explicit_and_before_cuda_context(self):
+        args = witness.parse_args(['--deterministic-gpu'])
+        fake, settings = self.fake_torch_controls()
+        with patch.dict(witness.os.environ, {'CUBLAS_WORKSPACE_CONFIG': 'previous'}):
+            controls = witness.configure_gpu_mode(args, fake)
+            self.assertEqual(controls['previous_cublas_workspace_config'], 'previous')
+            self.assertEqual(controls['cublas_workspace_config'], ':4096:8')
+            self.assertTrue(controls['deterministic_algorithms'])
+            self.assertFalse(controls['deterministic_warn_only'])
+            self.assertTrue(controls['cudnn_deterministic'])
+            self.assertFalse(controls['cudnn_benchmark'])
+            self.assertFalse(controls['cuda_initialized_before_settings'])
+            self.assertEqual(settings['calls'], ['deterministic_controls'])
+        fake, settings = self.fake_torch_controls(initialized=True)
+        with patch.dict(witness.os.environ, {'CUBLAS_WORKSPACE_CONFIG': 'previous'}):
+            with self.assertRaisesRegex(RuntimeError, 'before CUDA initialization'):
+                witness.configure_gpu_mode(args, fake)
+            self.assertEqual(witness.os.environ['CUBLAS_WORKSPACE_CONFIG'], 'previous')
+            self.assertEqual(settings['calls'], [])
+
+    def test_default_gpu_controls_are_recorded_without_modification(self):
+        fake, settings = self.fake_torch_controls()
+        with patch.dict(witness.os.environ, {'CUBLAS_WORKSPACE_CONFIG': 'original'}):
+            controls = witness.configure_gpu_mode(witness.parse_args([]), fake)
+            self.assertEqual(controls['cublas_workspace_config'], 'original')
+            self.assertFalse(controls['deterministic_algorithms'])
+            self.assertFalse(controls['cudnn_deterministic'])
+            self.assertTrue(controls['cudnn_benchmark'])
+            self.assertEqual(settings['calls'], [])
 
     def test_blocked_pid_refuses_before_gpu_query(self):
         args = witness.parse_args(['--blocked-pid', '11392'])
@@ -116,6 +175,27 @@ class RealBatchWitnessTests(unittest.TestCase):
         for invalid in [torch.tensor([1., float('nan')]), torch.tensor([1, 2])]:
             with self.assertRaises(AssertionError):
                 witness.compare(reference, dict(value=invalid), torch, atol=1.)
+
+    @unittest.skipUnless(importlib.util.find_spec('torch'), 'requires CPU torch in the target environment')
+    def test_diagnostic_collects_all_tensor_differences_without_passing_them(self):
+        import torch
+        a = dict(gradients=dict(first=torch.tensor([1., 2.]), second=torch.tensor([0.]),
+                               identical=torch.tensor([4.])), rng=torch.tensor([1, 2], dtype=torch.uint8))
+        b = dict(gradients=dict(first=torch.tensor([1., 3.]), second=torch.tensor([2.]),
+                               identical=torch.tensor([4.])), rng=torch.tensor([1, 2], dtype=torch.uint8))
+        diagnostic = witness.diagnose_differences(a, b, torch)
+        self.assertEqual(diagnostic['tensors'], 4)
+        self.assertEqual([item['path'] for item in diagnostic['differences']],
+                         ['root.gradients.first', 'root.gradients.second'])
+        first, second = diagnostic['differences']
+        self.assertEqual(first['max_absolute_difference'], 1.)
+        self.assertAlmostEqual(first['relative_l2'], 1. / 5.**.5)
+        self.assertIsNone(second['relative_l2'])
+        with self.assertRaises(AssertionError):
+            witness.compare(a, b, torch)  # Measuring differences never changes the strict witness.
+        b['rng'][0] = 3
+        with self.assertRaises(AssertionError):
+            witness.diagnose_differences(a, b, torch)
 
 
 if __name__ == '__main__':
