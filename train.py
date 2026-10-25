@@ -50,6 +50,12 @@ def parser():
     result.add_argument('--config', type=Path, help='Optional exact copy of bundle config.h1.json')
     result.add_argument('--device', default='cpu', help='cpu, cuda or cuda:N; selected by the user')
     result.add_argument('--cpu-threads', type=int, default=2)
+    result.add_argument('--batch-size', type=int, default=1,
+                        help='Explicit training recipe variant; use the same value for H1 and P1')
+    result.add_argument('--validation-batch-size', type=int, default=None,
+                        help='Validation batching; defaults to training batch size')
+    result.add_argument('--sample-cache-gib', type=float, default=0.,
+                        help='Shared CPU tensor-cache budget for training and validation, 0..64 GiB')
     result.add_argument('--epochs', type=int, choices=(2, 30), default=30)
     result.add_argument('--execute', action='store_true', help='Explicitly start this one training stage')
     return result
@@ -185,6 +191,12 @@ def _check_own_det(directory, binding):
 def preflight(args):
     if args.cpu_threads < 1 or not re.fullmatch(r'cpu|cuda(?::\d+)?', args.device):
         raise ValueError('Use positive CPU threads and cpu/cuda/cuda:N')
+    validation_batch_size = args.validation_batch_size or args.batch_size
+    if (not 1 <= args.batch_size <= 128 or
+            (args.validation_batch_size is not None and not 1 <= args.validation_batch_size <= 128)):
+        raise ValueError('Training and validation batch sizes must be between 1 and 128')
+    if not math.isfinite(args.sample_cache_gib) or not 0 <= args.sample_cache_gib <= 64:
+        raise ValueError('Sample cache must be a finite budget from 0 to 64 GiB')
     if args.epochs not in (2, 30) or args.phase not in ('det', 'diff'):
         raise ValueError('Only the fixed 30-epoch recipe or isolated 2-epoch smoke is supported')
     root, run_root = args.data_root.resolve(), args.run_dir.resolve()
@@ -229,7 +241,9 @@ def preflight(args):
     binding = dict(source_sha256=source_digest(), entry_sha256=file_sha256(__file__),
         bundle_sha256=file_sha256(bundle_path),
         files={name: file_sha256(path) for name, path in files.items()},
-        epochs=args.epochs, profile=profile, recipe=RECIPE)
+        epochs=args.epochs, profile=profile, recipe=dict(RECIPE, batch_size=args.batch_size),
+        performance=dict(sample_cache_gib=args.sample_cache_gib,
+                         validation_batch_size=validation_batch_size, num_workers=0))
     backbone = _check_own_det(run_root / profile / 'det', binding) if args.phase == 'diff' else None
     return dict(schema_version='fwt_portable_preflight_v1', status='passed',
         phase=args.phase, profile=profile, training_started=False, heldout_evaluation=False,
@@ -264,7 +278,9 @@ def execute(args, checked):
     previous_root = artifacts.WORKSPACE
     artifacts.WORKSPACE = Path(checked['run_root'])
     train_args = SimpleNamespace(manifest=checked['manifest'], normalizer=checked['normalizer'],
-        output=checked['output'], epochs=args.epochs, batch_size=1, learning_rate=.001,
+        output=checked['output'], epochs=args.epochs, batch_size=args.batch_size, learning_rate=.001,
+        validation_batch_size=checked['binding']['performance']['validation_batch_size'],
+        sample_cache_gib=args.sample_cache_gib,
         seed=0, device=args.device, loss='focal', samples=8, sampling_steps=4,
         sampler='ddim', architecture='fwt', backbone=checked['backbone'],
         resume=None, stop_after_epoch=None)

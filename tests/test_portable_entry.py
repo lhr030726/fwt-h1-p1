@@ -147,6 +147,29 @@ class PortableTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'frozen H1/P1'):
             train.preflight(self.f.args())
 
+    def test_performance_variant_is_explicitly_bound(self):
+        args = self.f.args()
+        default = train.preflight(args)['binding']
+        args.batch_size, args.validation_batch_size, args.sample_cache_gib = 8, 2, 40.
+        changed = train.preflight(args)['binding']
+        self.assertEqual(changed['recipe']['batch_size'], 8)
+        self.assertEqual(changed['performance'], dict(sample_cache_gib=40.,
+            validation_batch_size=2, num_workers=0))
+        self.assertEqual(default['recipe']['batch_size'], 1)
+        self.assertEqual(changed['files'], default['files'])
+        self.assertNotEqual(changed, default)
+
+    def test_invalid_resource_limits_fail_before_data_reads(self):
+        for attribute, value in [('batch_size', 0), ('batch_size', 129),
+                ('validation_batch_size', 0), ('validation_batch_size', 129),
+                ('sample_cache_gib', float('nan')), ('sample_cache_gib', -1.),
+                ('sample_cache_gib', 65.)]:
+            with self.subTest(attribute=attribute, value=value):
+                args = self.f.args()
+                setattr(args, attribute, value)
+                with self.assertRaises(ValueError):
+                    train.preflight(args)
+
     def test_swapped_input_label_pairing_rejected_by_published_index(self):
         first, second = self.f.rows[:2]
         first['label_path'], second['label_path'] = second['label_path'], first['label_path']
@@ -244,8 +267,11 @@ class PortableTests(unittest.TestCase):
 
         fake_engine.train = run
         old_cwd = Path.cwd()
+        import fwt_v2
         with patch.dict(sys.modules, {'torch': fake_torch, 'fwt_v2.engine': fake_engine,
-                                     'fwt_v2.artifacts': fake_artifacts}):
+                                     'fwt_v2.artifacts': fake_artifacts}), \
+                patch.object(fwt_v2, 'engine', fake_engine, create=True), \
+                patch.object(fwt_v2, 'artifacts', fake_artifacts, create=True):
             receipt = train.execute(args, checked)
         self.assertEqual(Path.cwd(), old_cwd)
         self.assertEqual(fake_artifacts.WORKSPACE, self.root)

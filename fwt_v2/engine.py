@@ -130,8 +130,11 @@ def deterministic_loss(logits, target, mask, loss='focal'):
     return bce[mask.bool()].mean()
 
 
-def make_loader(manifest, role, normalizer, data_config, batch_size, shuffle=False):
+def make_loader(manifest, role, normalizer, data_config, batch_size, shuffle=False, sample_cache=None):
     dataset = RCDADataset(manifest, role, normalizer, data_config)
+    if sample_cache is not None:
+        from .sample_cache import CachedDataset
+        dataset = CachedDataset(dataset, sample_cache)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0)
 
 
@@ -270,13 +273,26 @@ def train(args, config, family):
         cls = ConditionalResidualDiffusion if family == 'diff' else DeterministicResidualHead
         head = cls(diffusion_config).to(args.device)
         model, role = head, 'residual_train'
-    train_loader = make_loader(manifest, role, normalizer, data_config, args.batch_size, True)
+    cache_gib = getattr(args, 'sample_cache_gib', 0.)
+    if not math.isfinite(cache_gib) or not 0 <= cache_gib <= 64:
+        raise ValueError('Sample cache must be a finite budget from 0 to 64 GiB')
+    validation_batch_size = getattr(args, 'validation_batch_size', None) or args.batch_size
+    if type(validation_batch_size) is not int or validation_batch_size < 1:
+        raise ValueError('Validation batch size must be a positive integer')
+    sample_cache = None
+    if cache_gib:
+        from .sample_cache import SharedTensorCache
+        sample_cache = SharedTensorCache(int(cache_gib * 1024**3))
+    train_loader = make_loader(manifest, role, normalizer, data_config, args.batch_size, True,
+                               sample_cache=sample_cache)
     if family == 'det_budget_control':
-        extra = make_loader(manifest, 'residual_train', normalizer, data_config, args.batch_size).dataset
+        extra = make_loader(manifest, 'residual_train', normalizer, data_config, args.batch_size,
+                            sample_cache=sample_cache).dataset
         combined = ConcatDataset([train_loader.dataset, extra])
         combined.samples = train_loader.dataset.samples + extra.samples
         train_loader = DataLoader(combined, batch_size=args.batch_size, shuffle=True, num_workers=0)
-    val_loader = make_loader(manifest, 'validation', normalizer, data_config, args.batch_size)
+    val_loader = make_loader(manifest, 'validation', normalizer, data_config, validation_batch_size,
+                             sample_cache=sample_cache)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     provenance = dict(schema='fwt_checkpoint_v2', family=family, architecture=architecture,
                       model_config=asdict(model_config), data_config=asdict(data_config),
@@ -303,6 +319,8 @@ def train(args, config, family):
                                    backbone=sum(p.numel() for p in backbone.parameters()))
     provenance['device'] = str(args.device)
     provenance['cpu_threads'] = torch.get_num_threads()
+    provenance['performance'] = dict(sample_cache_gib=cache_gib, num_workers=0,
+                                     validation_batch_size=validation_batch_size)
     provenance['manifest_file_sha256'] = sha256(args.manifest)
     # Explicit defaults bind AdamW's actual recipe, not merely its class name.
     provenance['optimizer_defaults'] = deepcopy(optimizer.defaults)
@@ -424,6 +442,8 @@ def train(args, config, family):
         diagnostics.update(total_updates=updates, completed_epochs=epoch + 1,
                            remaining_epochs=args.epochs - epoch - 1,
                            wall_seconds=time.perf_counter() - started)
+        if sample_cache is not None:
+            diagnostics['sample_cache'] = sample_cache.stats()
         # Every restart boundary must still describe this exact execution.
         if (provenance['source_sha256'] != source_digest() or
                 provenance['normalizer_sha256'] != sha256(args.normalizer) or
