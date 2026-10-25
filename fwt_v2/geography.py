@@ -23,7 +23,14 @@ def validate_georeference(value, shape, pixel_size_m):
     return tuple(affine.tolist()), value['crs']
 
 
-@lru_cache(maxsize=32)
+# The portable development manifest has 645 distinct 256x256 grids. Keeping
+# their immutable FP64 bases takes about 1.26 GiB and avoids recomputing the
+# geodesic Jacobian on almost every shuffled sample. This bound is a count of
+# geometries, not a byte limit; larger grids need a lower configured bound.
+IMAGE_BASIS_CACHE_MAXSIZE = 1024
+
+
+@lru_cache(maxsize=IMAGE_BASIS_CACHE_MAXSIZE)
 def _image_basis(affine, crs_text, shape):
     from pyproj import CRS, Transformer
 
@@ -57,6 +64,20 @@ def _image_basis(affine, crs_text, shape):
         raise ValueError('Invalid local geographic-to-image basis')
     result.setflags(write=False)
     return result
+
+
+def configure_image_basis_cache(maxsize=IMAGE_BASIS_CACHE_MAXSIZE):
+    """Set a bounded process-local performance cache; calculations are unchanged.
+
+    Configure before creating data-loader workers. Existing cache entries are
+    discarded, and no input, random state, model parameter or data file changes.
+    """
+    if type(maxsize) is not int or not 1 <= maxsize <= IMAGE_BASIS_CACHE_MAXSIZE:
+        raise ValueError(f'image basis cache size must be in [1,{IMAGE_BASIS_CACHE_MAXSIZE}]')
+    global _image_basis
+    calculation = _image_basis.__wrapped__
+    _image_basis.cache_clear()
+    _image_basis = lru_cache(maxsize=maxsize)(calculation)
 
 
 def geographic_wind(speed, angle, georeference, pixel_size_m):
