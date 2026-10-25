@@ -1,0 +1,23 @@
+# Private input arrays and release cache stay outside Git history.
+/data/
+/.data-cache/
+/runs/
+*.npy
+*.npz
+*.pth
+*.pt
+*.ckpt
+*.tar
+*.tar.gz
+*.zip
+*.partial
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db

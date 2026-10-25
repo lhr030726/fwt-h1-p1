@@ -1,0 +1,17 @@
+# Stable source/index bytes on Linux and Windows; the release index is byte-bound.
+* text=auto eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+*.txt text eol=lf
+*.sh text eol=lf
+*.npy -text
+*.npz -text
+*.pth -text
+*.pt -text
+*.tar.gz -text
+*.zip -text
+# Preserve frozen numerical source bytes (including original CRLF) across clones.
+# Python accepts those line endings on Linux; new entry/scripts/index remain LF.
+/fwt_v2/*.py -text

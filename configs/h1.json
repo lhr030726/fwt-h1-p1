@@ -1,0 +1,54 @@
+{
+  "data": {
+    "wind_convention": "geographic_towards_ccw_from_east_covariates",
+    "wind_reference": "geographic_east_north",
+    "wind_metadata_review": "POWER hourly WS50M/WD50M at inputday UTC00-23 patchcentre; 50mHEIGHT regionalreference, not gusts. Meteorological FROMnorthCW to east/north TOWARDS then imageunitprojection. H0/H1 shared scalarmeanspeed+unitmeanvector; no windprior. Retrospective source availability only.",
+    "pixel_size_m": 50.0,
+    "distance_scale_m": 1600.0,
+    "input_schema_version": "fwt_rcda_inputs_v5_power_wind_covariates22",
+    "external_wind_manifest": "weather_manifest.json",
+    "external_wind_manifest_sha256": "0a05b7ded799bdf061bd4b72844b5104926640f059e7ef9f328918eb660bc4fe",
+    "external_wind_variant": "hourly"
+  },
+  "model": {
+    "widths": [
+      16,
+      32,
+      64,
+      128
+    ],
+    "decoder_widths": [
+      64,
+      128,
+      256,
+      512
+    ],
+    "prop_channels": 64,
+    "use_gate": true,
+    "use_distance": true,
+    "use_propagation": true,
+    "use_physics_prior": true,
+    "drop_modal": 0.15,
+    "propagation_steps": 3,
+    "propagation_radius": 3,
+    "normalization": "group",
+    "norm_max_groups": 8,
+    "use_wind_prior": false,
+    "schema_version": "rcda22-semantic21-v3",
+    "extra_weather_channels": 4
+  },
+  "diffusion": {
+    "timesteps": 200,
+    "hidden_channels": [
+      32,
+      64,
+      96,
+      128
+    ],
+    "condition_channels": 16,
+    "condition_mode": "multiscale",
+    "prediction_type": "clean_probability",
+    "training_timestep_sampling": "antithetic"
+  },
+  "purpose": "Full Tb/Tr/V preparation only; no long training or held-out evaluation authorized."
+}
