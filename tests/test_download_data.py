@@ -276,6 +276,88 @@ class DownloaderTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(d.main(["--index", str(index_path), "--destination", str(self.root), "--verify-only"]), 0)
 
+    def test_default_main_anonymous_round_trip_ignores_existing_credentials(self):
+        index, raw, content = fixture()
+        index_path = self.root / "data-index.json"
+        index_path.write_bytes(raw)
+        requests = []
+        class Opener:
+            def open(inner, request, **kwargs):
+                requests.append(request)
+                self.assertNotIn("Authorization", request.headers)
+                self.assertNotIn("Authorization", request.unredirected_hdrs)
+                suffix = request.full_url
+                if "/releases/tags/" in suffix:
+                    payload = json.dumps(dict(id=1, tag_name=d.DEFAULT_TAG, draft=False)).encode()
+                elif "/assets?" in suffix:
+                    payload = json.dumps([
+                        dict(id=1, name=d.INDEX_ASSET, size=len(raw), state="uploaded"),
+                        dict(id=2, name="data-00000.tar.gz", size=len(content), state="uploaded")]).encode()
+                elif suffix.endswith("/assets/1"):
+                    payload = raw
+                elif suffix.endswith("/assets/2"):
+                    payload = content
+                else:
+                    self.fail("Unexpected mock API request")
+                return io.BytesIO(payload)
+        with patch.dict(os.environ, {"GH_TOKEN": "unused-private-token", "GITHUB_TOKEN": "also-unused"}), \
+                patch.object(d, "get_token", side_effect=AssertionError("Credentials must not be read")), \
+                patch.object(d.subprocess, "run", side_effect=AssertionError("gh must not be invoked")), \
+                patch.object(d.urllib.request, "build_opener", return_value=Opener()), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(d.main(["--index", str(index_path), "--destination", str(self.root)]), 0)
+        self.assertEqual(len(requests), 4)
+        self.assertEqual(d.verify_install(index, self.root)["files"], 2)
+        self.assertNotIn("unused-private-token", output.getvalue())
+
+    def test_authenticated_main_reads_credentials_only_when_explicit(self):
+        index, raw, _ = fixture()
+        index_path = self.root / "data-index.json"
+        index_path.write_bytes(raw)
+        with patch.object(d, "get_token", return_value="explicit-private-token") as token, \
+                patch.object(d, "GitHub") as client, \
+                patch.object(d, "download", return_value={"status": "mock-completed"}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(d.main(["--index", str(index_path), "--authenticated"]), 0)
+        token.assert_called_once_with()
+        client.assert_called_once_with(d.DEFAULT_REPO, "explicit-private-token")
+
+    def test_authenticated_api_sends_token_only_as_unredirected_header(self):
+        class Opener:
+            def open(inner, request, **kwargs):
+                self.assertNotIn("Authorization", request.headers)
+                self.assertEqual(request.unredirected_hdrs.get("Authorization"), "Bearer explicit-private-token")
+                self.assertNotIn("explicit-private-token", request.full_url)
+                return io.BytesIO(b"{}")
+        with d.GitHub("owner/repo", "explicit-private-token", Opener()).open("/releases") as response:
+            self.assertEqual(response.read(), b"{}")
+
+    def test_anonymous_403_hint_does_not_authenticate_or_retry(self):
+        requests = []
+        class Opener:
+            def open(inner, request, **kwargs):
+                requests.append(request)
+                raise urllib.error.HTTPError("https://signed-secret/?token=secret", 403, "secret", {}, None)
+        with patch.object(d, "get_token", side_effect=AssertionError("No automatic auth")), \
+                self.assertRaises(d.DownloadError) as caught:
+            d.GitHub("owner/repo", opener=Opener()).open("/releases")
+        message = str(caught.exception)
+        self.assertIn("Anonymous", message)
+        self.assertIn("--authenticated", message)
+        self.assertIn("No automatic retry", message)
+        self.assertNotIn("secret", message)
+        self.assertEqual(len(requests), 1)
+
+    def test_verify_only_ignores_authenticated_flag(self):
+        _, raw, _, _, _ = self.install()
+        index_path = self.root / "data-index.json"
+        index_path.write_bytes(raw)
+        with patch.object(d, "get_token", side_effect=AssertionError("No credentials for local verify")), \
+                patch.object(d, "GitHub", side_effect=AssertionError("No network for local verify")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(d.main(["--index", str(index_path), "--destination", str(self.root),
+                                     "--verify-only", "--authenticated"]), 0)
+
     def test_publication_never_replaces_concurrent_target(self):
         source, target = self.root / "source", self.root / "target"
         source.write_bytes(b"source")

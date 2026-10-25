@@ -1,4 +1,4 @@
-# Private input arrays and release cache stay outside Git history.
+# Input arrays and release cache stay outside Git history.
 /data/
 /.data-cache/
 /runs/
@@ -15,6 +15,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+/.venv-fwt/
 venv/
 .env
 .env.*

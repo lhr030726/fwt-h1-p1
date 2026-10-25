@@ -1,8 +1,9 @@
-"""Download the commit-pinned private release data; never import ML or start training.
+"""Download commit-pinned release data anonymously; never start training.
 
 Uses only Python's standard library. Completed shards are reusable; an interrupted
-shard is downloaded afresh. Credentials never enter a URL, subprocess argument,
-file, or diagnostic. Archive installation is confined to regular files in data/.
+shard is downloaded afresh. Only --authenticated reads existing GitHub credentials;
+they never enter a URL, subprocess argument, file, or diagnostic. Archive
+installation is confined to regular files in data/.
 """
 from __future__ import annotations
 
@@ -195,7 +196,7 @@ class SafeRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class GitHub:
-    def __init__(self, repo, token, opener=None):
+    def __init__(self, repo, token=None, opener=None):
         require(re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) is not None, "Expected owner/repository.")
         self.repo, self._token = repo, token
         self.opener = opener or urllib.request.build_opener(SafeRedirect())
@@ -204,10 +205,16 @@ class GitHub:
         request = urllib.request.Request("https://api.github.com/repos/" + self.repo + suffix,
                                          headers={"Accept": "application/octet-stream" if binary else "application/vnd.github+json",
                                                   "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "fwt-h1-p1-data/1"})
-        request.add_unredirected_header("Authorization", "Bearer " + self._token)
+        if self._token:
+            request.add_unredirected_header("Authorization", "Bearer " + self._token)
         try:
             return self.opener.open(request, timeout=120)
         except urllib.error.HTTPError as exc:
+            if not self._token and exc.code in (403, 429):
+                raise DownloadError(
+                    f"Anonymous GitHub request returned HTTP {exc.code}; possible rate limit or access restriction. "
+                    "Wait before retrying, or explicitly use --authenticated after gh auth login "
+                    "or secure GH_TOKEN/GITHUB_TOKEN setup. No automatic retry.") from None
             raise DownloadError(f"GitHub returned HTTP {exc.code}; verify repository access and release assets.") from None
         except (urllib.error.URLError, OSError, ValueError):
             raise DownloadError("GitHub request failed; no credentials or signed URLs are included in this diagnostic.") from None
@@ -365,12 +372,15 @@ def main(argv=None):
     parser.add_argument("--tag", default=DEFAULT_TAG)
     parser.add_argument("--index", type=Path, default=home / INDEX_ASSET)
     parser.add_argument("--destination", type=Path, default=home)
+    parser.add_argument("--authenticated", action="store_true",
+                        help="Explicitly use GH_TOKEN/GITHUB_TOKEN or gh auth token; default is anonymous.")
     parser.add_argument("--verify-only", action="store_true", help="Verify installed files locally; no token or network.")
     args = parser.parse_args(argv)
     try:
         index, raw = load_index(args.index)
         result = (verify_install(index, args.destination) if args.verify_only else
-                  download(index, raw, GitHub(args.repo, get_token()), args.tag, args.destination))
+                  download(index, raw, GitHub(args.repo, get_token() if args.authenticated else None),
+                           args.tag, args.destination))
         print(json.dumps(result, ensure_ascii=False))
         return 0
     except DownloadError as exc:
