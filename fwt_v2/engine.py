@@ -218,12 +218,16 @@ def validation_records(backbone, head, loader, device, sampling):
 def train(args, config, family):
     from copy import deepcopy
     from .reporting import operating_point_report
+    from .training_control import TrainingController, policy_for_epochs, validate_completion
     from .training_state import (training_binding, load_training_state, save_training_state,
                                  restore_rng, restore_training_parameters, sample_file_identity)
 
     started = time.perf_counter()
     if args.epochs < 1 or args.batch_size < 1 or args.learning_rate <= 0:
         raise ValueError('Positive explicit epochs, batch size and learning rate required')
+    policy = policy_for_epochs(args.epochs)
+    if getattr(args, 'training_control', policy) != policy:
+        raise ValueError('Explicit training-control policy differs from the registered budget')
     stop_after = getattr(args, 'stop_after_epoch', None)
     if stop_after is not None and (type(stop_after) is not int or not 1 <= stop_after < args.epochs):
         raise ValueError('stop-after-epoch must be positive and below the unchanged total epoch budget')
@@ -278,6 +282,7 @@ def train(args, config, family):
         train_loader = DataLoader(combined, batch_size=args.batch_size, shuffle=True, num_workers=0)
     val_loader = make_loader(manifest, 'validation', normalizer, data_config, args.batch_size)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    controller = TrainingController(optimizer, args.epochs, policy)
     provenance = dict(schema='fwt_checkpoint_v2', family=family, architecture=architecture,
                       model_config=asdict(model_config), data_config=asdict(data_config),
                       manifest_sha256=digest, normalizer_sha256=sha256(args.normalizer),
@@ -291,6 +296,7 @@ def train(args, config, family):
                                                           if family == 'diff' else 'residual_mse'),
                       optimizer='AdamW', learning_rate=args.learning_rate,
                       batch_size=args.batch_size, requested_epochs=args.epochs,
+                      training_control=deepcopy(policy),
                       initialization='new_random_initialization', selection_frozen=False)
     provenance['source_sha256'] = source_digest()
     if head is not None:
@@ -314,6 +320,7 @@ def train(args, config, family):
         raise ValueError('Controlled stop must be later than the restored completed epoch')
     if restart:
         restore_training_parameters(restart, model, optimizer)
+        controller.load_state_dict(restart['training_control_state'], restart['history'])
         provenance['resume'] = dict(training_state_sha256=sha256(resume_path),
                                     completed_epochs=start_epoch, source=str(Path(resume_path).resolve()))
     destination.mkdir(parents=True, exist_ok=True)
@@ -322,6 +329,8 @@ def train(args, config, family):
                        parameters=provenance['parameters'], device=provenance['device'],
                        cpu_threads=provenance['cpu_threads'], source_sha256=provenance['source_sha256'],
                        total_updates=0, completed_epochs=0, remaining_epochs=args.epochs,
+                       actual_epochs=0, max_epochs=args.epochs, training_control=deepcopy(policy),
+                       stop_reason=None, selection_frozen=False,
                        first_batch=None, epochs=[], frozen_backbone=None,
                        wall_seconds_scope='current_process_segment')
     if family == 'diff':
@@ -348,6 +357,7 @@ def train(args, config, family):
         atomic_json(destination / 'history.json', history)
         atomic_json(destination / 'diagnostics.json', diagnostics)
         restore_rng(restart['rng_state'], args.device)
+    stop_reason = None
     for epoch in range(start_epoch, args.epochs):
         epoch_started = time.perf_counter()
         model.train()
@@ -388,6 +398,7 @@ def train(args, config, family):
         ap = metrics['pooled_ap']
         if ap is None:
             raise ValueError('Validation has no valid positive pixels; AP selection is undefined')
+        control = controller.step(ap)
         candidate_threshold = select_raw_threshold(records)
         operating_points = operating_point_report(records, candidate_threshold, provenance['sampling'])
         epoch_checks = dict(epoch=epoch, updates=len(losses), cumulative_updates=updates,
@@ -408,7 +419,8 @@ def train(args, config, family):
             for key in ('diffusion_timestep_exposures', 'diffusion_denoiser_evaluations', 'diffusion_noise_draws'):
                 diagnostics['total_' + key] += epoch_checks[key]
         history.append(dict(epoch=epoch, training_loss=float(np.mean(losses)), validation=metrics,
-                            validation_operating_points=operating_points, training_checks=epoch_checks))
+                            validation_operating_points=operating_points, training_checks=epoch_checks,
+                            training_control=control))
         if ap > best:
             best = ap
             selected = dict(provenance, epoch=epoch, validation_ap=ap,
@@ -421,7 +433,8 @@ def train(args, config, family):
             atomic_checkpoint(destination / 'best.pth', selected)
         epoch_checks['wall_seconds'] = time.perf_counter() - epoch_started
         diagnostics['epochs'].append(epoch_checks)
-        diagnostics.update(total_updates=updates, completed_epochs=epoch + 1,
+        diagnostics.update(total_updates=updates, completed_epochs=epoch + 1, actual_epochs=epoch + 1,
+                           training_control_state=deepcopy(control),
                            remaining_epochs=args.epochs - epoch - 1,
                            wall_seconds=time.perf_counter() - started)
         # Every restart boundary must still describe this exact execution.
@@ -439,15 +452,26 @@ def train(args, config, family):
             frozen['unchanged'] = frozen['state_sha256_before'] == frozen['state_sha256_after']
             if not frozen['unchanged'] or frozen['parameters_require_grad'] or not frozen['gradients_absent']:
                 raise RuntimeError('Frozen backbone state or gradient isolation changed during residual training')
-        if stop_after == epoch + 1:
+        stop_reason = ('early_stopping' if control['should_stop'] else
+                       'max_epochs' if epoch + 1 == args.epochs else None)
+        if stop_reason is not None:
+            # Persist the terminal boundary before final artifact freeze. A crash
+            # here must never resume beyond the first registered stopping point.
+            diagnostics.update(status='finishing', stop_reason=stop_reason, remaining_epochs=0,
+                               budget_remaining_epochs=args.epochs - epoch - 1)
+        elif stop_after == epoch + 1:
             diagnostics.update(status='stopped_after_epoch', completed_epochs=epoch + 1,
                                remaining_epochs=args.epochs - epoch - 1, selection_frozen=False)
         atomic_json(destination / 'history.json', history)
         atomic_json(destination / 'diagnostics.json', diagnostics)
         save_training_state(destination / 'last.pth', binding=binding, model=model, optimizer=optimizer,
             device=args.device, completed_epochs=epoch + 1, history=history, selected=selected,
-            selected_validation=selected_validation, diagnostics=diagnostics, updates=updates, best=best)
-        print(f'epoch={epoch} family={family} train_loss={np.mean(losses):.6f} val_AP={ap:.6f}', flush=True)
+            selected_validation=selected_validation, diagnostics=diagnostics, updates=updates, best=best,
+            training_control_state=controller.state_dict())
+        print(f'epoch={epoch} family={family} train_loss={np.mean(losses):.6f} val_AP={ap:.6f} '
+              f'next_lr={control["learning_rates_after"]} no_improvement={control["bad_epochs"]}', flush=True)
+        if stop_reason is not None:
+            break
         if stop_after == epoch + 1:
             return dict(training_state=str(destination / 'last.pth'), family=family,
                         status='stopped_after_epoch', completed_epochs=epoch + 1,
@@ -463,7 +487,15 @@ def train(args, config, family):
         atomic_json(destination / 'diagnostics.json', diagnostics)
         if not frozen['unchanged'] or frozen['parameters_require_grad'] or not frozen['gradients_absent']:
             raise RuntimeError('Frozen backbone state or gradient isolation changed during residual training')
-    selected.update(selection_frozen=True, completed_epochs=args.epochs, total_updates=updates)
+    actual_epochs = len(history)
+    selected.update(selection_frozen=True, completed_epochs=actual_epochs, actual_epochs=actual_epochs,
+                    max_epochs=args.epochs, stop_reason=stop_reason, total_updates=updates,
+                    training_control_state=deepcopy(controller.state))
+    diagnostics.update(status='completed', wall_seconds=time.perf_counter() - started,
+                       completed_epochs=actual_epochs, actual_epochs=actual_epochs, remaining_epochs=0,
+                       budget_remaining_epochs=args.epochs - actual_epochs, selection_frozen=True,
+                       stop_reason=stop_reason, selected_epoch=selected['epoch'])
+    completion = validate_completion(diagnostics, selected, history, args.epochs, policy)
     if restart:
         selected['resume'] = provenance['resume']
     atomic_checkpoint(destination / 'best.pth', selected)
@@ -477,8 +509,5 @@ def train(args, config, family):
         selection_metric=provenance['selection_metric'], selection_tie_rule=provenance['selection_tie_rule'],
         raw_threshold=selected['raw_threshold'], raw_threshold_rule=selected['raw_threshold_rule'],
         **selected_validation))
-    diagnostics.update(status='completed', wall_seconds=time.perf_counter() - started,
-                       completed_epochs=args.epochs, remaining_epochs=0, selection_frozen=True,
-                       selected_epoch=selected['epoch'])
     atomic_json(destination / 'diagnostics.json', diagnostics)
-    return dict(checkpoint=str(destination / 'best.pth'), family=family, validation_ap=best)
+    return dict(checkpoint=str(destination / 'best.pth'), family=family, validation_ap=best, **completion)

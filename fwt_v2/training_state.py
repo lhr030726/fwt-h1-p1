@@ -14,8 +14,9 @@ import numpy as np
 import torch
 
 from .artifacts import atomic_checkpoint
+from .training_control import policy_for_epochs, replay_history
 
-SCHEMA = 'fwt_training_state_v1'
+SCHEMA = 'fwt_training_state_v2'
 
 
 def optimizer_state_integrity(saved):
@@ -138,8 +139,15 @@ def restore_training_parameters(bundle, model, optimizer):
     _check_model_state(bundle['selected']['state_dict'], expected)
     saved = bundle['optimizer_state_dict']
     current = optimizer.state_dict()
-    if saved.get('param_groups') != current['param_groups']:
-        raise ValueError('Restart AdamW parameter groups/settings differ from the bound recipe')
+    progress = validate_control_state(bundle)
+    expected_groups = deepcopy(current['param_groups'])
+    rates = progress['learning_rates_after']
+    if len(expected_groups) != len(rates):
+        raise ValueError('Restart AdamW parameter-group count differs')
+    for group, rate in zip(expected_groups, rates):
+        group['lr'] = rate
+    if saved.get('param_groups') != expected_groups:
+        raise ValueError('Restart AdamW settings or replayed learning rates differ from the bound recipe')
     parameters = {index: parameter for serialized, group in zip(current['param_groups'], optimizer.param_groups)
                   for index, parameter in zip(serialized['params'], group['params'])}
     if not isinstance(saved.get('state'), dict) or not set(saved['state']) <= set(parameters):
@@ -173,14 +181,40 @@ def _check_model_state(state, expected):
 
 
 def save_training_state(path, *, binding, model, optimizer, device, completed_epochs,
-                        history, selected, selected_validation, diagnostics, updates, best):
+                        history, selected, selected_validation, diagnostics, updates, best,
+                        training_control_state):
     bundle = dict(schema=SCHEMA, binding=deepcopy(binding), completed_epochs=completed_epochs,
         model_state_dict={key: value.detach().cpu().clone() for key, value in model.state_dict().items()},
         optimizer_state_dict=deepcopy(optimizer.state_dict()), rng_state=capture_rng(device),
         history=deepcopy(history), selected=deepcopy(selected), selected_validation=deepcopy(selected_validation),
-        diagnostics=deepcopy(diagnostics), updates=updates, best_validation_ap=best)
+        diagnostics=deepcopy(diagnostics), updates=updates, best_validation_ap=best,
+        training_control_state=deepcopy(training_control_state))
     bundle['optimizer_integrity'] = optimizer_state_integrity(bundle['optimizer_state_dict'])
     atomic_checkpoint(path, bundle)
+
+
+def validate_control_state(bundle):
+    """Metadata replay guards adaptive restarts before touching model/optimizer."""
+    provenance = bundle['binding']['provenance']
+    requested = provenance['requested_epochs']
+    policy = policy_for_epochs(requested)
+    if provenance.get('training_control') != policy:
+        raise ValueError('Restart training-control policy differs from the epoch recipe')
+    rates = [provenance['learning_rate']]
+    progress = replay_history(bundle['history'], requested, policy, rates)
+    saved = bundle.get('training_control_state')
+    if (not isinstance(saved, dict) or saved.get('schema') != 'fwt_training_control_state_v1' or
+            saved.get('max_epochs') != requested or saved.get('policy') != policy or
+            saved.get('initial_lrs') != rates or saved.get('progress') != progress or
+            bundle['completed_epochs'] != progress['completed_epochs'] or
+            bundle['diagnostics'].get('training_control_state') != progress):
+        raise ValueError('Restart controller state differs from replayed validation history')
+    if (progress['should_stop'] or progress['completed_epochs'] == requested or
+            bundle['diagnostics'].get('stop_reason') is not None or
+            bundle['diagnostics'].get('status') in ('finishing', 'completed') or
+            bundle['diagnostics'].get('selection_frozen') is True):
+        raise ValueError('Completed or early-stopped training cannot be resumed')
+    return progress
 
 
 def load_training_state(path, binding):
@@ -188,7 +222,7 @@ def load_training_state(path, binding):
     bundle = torch.load(path, map_location='cpu', weights_only=True)
     required = {'schema', 'binding', 'completed_epochs', 'model_state_dict', 'optimizer_state_dict',
                 'rng_state', 'history', 'selected', 'selected_validation', 'diagnostics', 'updates',
-                'best_validation_ap', 'optimizer_integrity'}
+                'best_validation_ap', 'optimizer_integrity', 'training_control_state'}
     if not isinstance(bundle, dict) or bundle.get('schema') != SCHEMA or not required <= bundle.keys():
         raise ValueError('Expected a complete full-epoch FWT training state')
     verify_optimizer_integrity(bundle)
@@ -202,6 +236,7 @@ def load_training_state(path, binding):
         raise ValueError('Invalid completed epoch count in restart state')
     if completed == requested:
         raise ValueError('Requested training budget already completed; resume cannot extend it')
+    validate_control_state(bundle)
     history = bundle['history']
     diagnostics = bundle['diagnostics']
     if (not isinstance(history, list) or len(history) != completed or
@@ -222,7 +257,7 @@ def load_training_state(path, binding):
     if type(updates) is not int or updates != expected_updates or diagnostics['total_updates'] != updates:
         raise ValueError('Restart update count disagrees with completed history')
     aps = [row['validation']['pooled_ap'] for row in history]
-    if not all(isinstance(ap, (float, int)) and np.isfinite(ap) and 0 <= ap <= 1 for ap in aps):
+    if not all(type(ap) in (float, int) and np.isfinite(ap) and 0 <= ap <= 1 for ap in aps):
         raise ValueError('Invalid validation AP in restart history')
     best = max(aps)
     selected_epoch = aps.index(best)

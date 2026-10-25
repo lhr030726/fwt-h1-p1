@@ -1,6 +1,6 @@
 # FWT H1 / P1：Ubuntu 22.04 从零开始训练
 
-本公开仓库提供两个主模型：**H1 确定性预测模型**，以及以本次 H1 最佳检查点为冻结骨干的 **P1 条件扩散模型**。默认分别训练 30 轮；二者都按验证集 AP 最大值选择检查点，相同 AP 保留较早轮次。这里只提供训练和验证选点，不包含测试集评估入口。
+本公开仓库提供两个主模型：**H1 确定性预测模型**，以及以本次 H1 最佳检查点为冻结骨干的 **P1 条件扩散模型**。默认每个阶段**最多 100 轮**，根据验证 AP 调整学习率，连续 15 轮没有提高时提前结束。二者都保存验证 AP 最大的检查点，相同 AP 保留较早轮次。这里只提供训练和验证选点，不包含测试集评估入口。
 
 默认输入为原 RCDA 特征加 **NASA POWER 50 m 高度小时风的日内摘要**。这些摘要不能还原每次日内转向或地面阵风。ASOS 分钟分支未在本仓库启用。H1 保留既定 Focal，P1 保留 clean-probability BCE，扩散仍是独立主模型之一。
 
@@ -98,7 +98,7 @@ python train.py --phase diff --device cuda --data-root data --run-dir runs/h1p1 
 
 **两轮演练仍使用完整的 Tb/Tr/V，不是只跑几个 batch，可能需要较长时间。**输出位于 `runs/h1p1/smoke-2ep/`，不会被正式 P1 当作正式 H1 骨干使用。演练完成后检查实际日志，再决定是否启动正式预算。
 
-正式训练由你分别手动启动；下面每个阶段默认 30 轮：
+正式训练由你分别手动启动；下面每个阶段默认最多 100 轮，可以提前结束：
 
 ```bash
 python train.py --phase det --device cuda --data-root data --run-dir runs/h1p1 --execute
@@ -106,13 +106,42 @@ python train.py --phase det --device cuda --data-root data --run-dir runs/h1p1 -
 python train.py --phase diff --device cuda --data-root data --run-dir runs/h1p1 --execute
 ```
 
-P1 只读取同一运行的 `runs/h1p1/formal/det/best.pth`，完成校验后冻结该骨干，再训练扩散头。结果分别位于 `runs/h1p1/formal/det/` 和 `runs/h1p1/formal/diff/`。入口不自动重试或串联下一阶段；已有非空输出不会被覆盖。新实验请选择新的 `--run-dir`，失败则保留现场并先检查回执。
+P1 只读取同一运行的 `runs/h1p1/formal-100-adaptive-v1/det/best.pth`，完成校验后冻结该骨干，再训练扩散头。结果分别位于 `runs/h1p1/formal-100-adaptive-v1/det/` 和 `runs/h1p1/formal-100-adaptive-v1/diff/`。H1 按规则提前结束且完成选点后，P1 就可以启动，不必等到 100 轮。两个阶段的实际轮数可以不同。
+
+默认训练控制规则如下；这些是待实测的候选配方，不代表已经证明优于原 30 轮：
+
+| 项目 | 设置 |
+|---|---|
+| 每阶段上限 | 100 轮 |
+| 验证与选点 | 每轮完整 V；pooled AP 最大，相同 AP 取最早轮 |
+| 初始学习率 | AdamW，`1e-3` |
+| 学习率下降 | `ReduceLROnPlateau(mode="max", factor=0.5, patience=5, threshold=0, threshold_mode="abs", cooldown=0, min_lr=1e-5, eps=1e-8)` |
+| 提前停止 | AP 连续 15 次每轮验证没有严格提高；相同 AP 也计为未提高 |
+| 其余配方 | seed=0、batch=1、FP32、原损失、原划分和归一化、固定扩散采样保持 |
+
+PyTorch 的 `patience=5` 在**第 6 次连续未改善的验证后**才触发学习率减半，新的学习率从下一轮使用。学习率降低不清零早停计数；早停仍从最近一次最佳 AP 开始计算。任何严格提高都会更新最佳检查点并清零早停计数。上限和早停都只使用 V，不读取校准集或最终集。[PyTorch 调度语义](https://docs.pytorch.org/docs/2.7/generated/torch.optim.lr_scheduler.ReduceLROnPlateau.html)
+
+训练结果会分别记录预定上限、实际完成轮数、停止原因、每轮学习率与最佳轮次。提前结束是有效完成；中断、异常或缺少完整回执不是完成，P1 会拒绝接收。
+
+入口不自动重试、续训或串联下一阶段；已有非空输出不会被覆盖。新实验请选择新的 `--run-dir`，失败则保留现场并先检查回执。原 30 轮已完成的结果不能直接续到 100 轮，也不能把旧版 H1 权重改名放入新阶段。底层中断状态只允许在同一代码、数据、配方和预定总预算内恢复；公开入口未暴露恢复开关。
+
+如需保留固定 30 轮对照，两个阶段都显式设置 `--epochs 30`：
+
+```bash
+python train.py --phase det --device cuda --data-root data --run-dir runs/h1p1_fixed30 --epochs 30 --execute
+# 等本次固定 30 轮 H1 完成后再执行：
+python train.py --phase diff --device cuda --data-root data --run-dir runs/h1p1_fixed30 --epochs 30 --execute
+```
+
+此模式仍采用固定学习率、不早停，输出在 `runs/h1p1_fixed30/formal/`。两轮演练也不启用调度/早停，输出仍在 `smoke-2ep/`。它们与新配方分开保存，不能跨模式使用 H1。新配方同时改变轮次上限和学习率策略，因此不能把效果差异单独归因于轮数。
+
+已克隆旧版时，先确认该目录没有训练进程，再执行 `git pull --ff-only`。本次数据包、依赖和模型结构未改，不必重新下载正确的数据或重装环境；新训练仍应先执行默认预检。
 
 ## 数据与结果边界
 
 - 次日目标、事件角色、Tb 归一化及天气来源固定；不使用验证/测试数据重新拟合统计或重新划分数据。
 - V 用于最大 AP 选点及阈值选择；本入口不自动进行独立校准或最终测试。
-- 30 + 30 是待用户执行的配置，不表示已经完成长训练或已经证明扩散优于 H1。
+- 最多 100 + 100 轮是待用户执行的新配置，不表示已经完成长训练、已经收敛或已经证明扩散优于 H1。
 - 这是独立 RCDA/FWT 实验线，不将其结果混入 WSTS 官方 12-fold 比较。
 
 已完成检查及未验证范围见 [VALIDATION.md](VALIDATION.md)。离线合成测试可运行 `python -B -m unittest discover -s tests -v`；它们不等于你的实际 GPU 模型训练验收。

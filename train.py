@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 from fwt_v2.portable import (PortableSources, bound_file, contained_path,
                              file_sha256, read_json)
+from fwt_v2.training_control import policy_for_epochs, validate_completion
 
 REPOSITORY = Path(__file__).resolve().parent
 DEVELOPMENT_ROLES = ('backbone_train', 'residual_train', 'validation')
@@ -35,6 +36,9 @@ RECIPE = dict(seed=0, batch_size=1, learning_rate=.001, optimizer='AdamW',
               weight_decay=.01, det_loss='focal_alpha_positive_0.75_gamma_2',
               diff_loss='clean_probability_bce', K=8, steps=4, sampler='ddim',
               checkpoint='maximum_full_validation_pooled_AP_earliest_tie')
+PROFILES = {2: 'smoke-2ep', 30: 'formal', 100: 'formal-100-adaptive-v1'}
+COMPLETION_FILES = ('best.pth', 'last.pth', 'selection.json', 'diagnostics.json',
+                    'history.json', 'configuration.json', 'validation_selected.json')
 
 
 def source_digest():
@@ -50,7 +54,8 @@ def parser():
     result.add_argument('--config', type=Path, help='Optional exact copy of bundle config.h1.json')
     result.add_argument('--device', default='cpu', help='cpu, cuda or cuda:N; selected by the user')
     result.add_argument('--cpu-threads', type=int, default=2)
-    result.add_argument('--epochs', type=int, choices=(2, 30), default=30)
+    result.add_argument('--epochs', type=int, choices=(2, 30, 100), default=100,
+                        help='100: adaptive maximum (default); 30: fixed legacy; 2: isolated smoke')
     result.add_argument('--execute', action='store_true', help='Explicitly start this one training stage')
     return result
 
@@ -161,32 +166,52 @@ def _check_array_index(index, manifest, data_root):
         raise ValueError('Array index must cover every input/label exactly once')
 
 
+def _validated_completion(directory, binding, phase):
+    """Read only JSON metadata; never deserialize a predictor or import torch."""
+    configuration = read_json(directory / 'configuration.json')
+    diagnostic = read_json(directory / 'diagnostics.json')
+    selection = read_json(directory / 'selection.json')
+    history = read_json(directory / 'history.json')
+    expected = dict(family=phase, requested_epochs=binding['epochs'],
+        source_sha256=binding['source_sha256'],
+        manifest_file_sha256=binding['files']['manifest'],
+        normalizer_sha256=binding['files']['normalizer'],
+        optimizer=RECIPE['optimizer'], learning_rate=RECIPE['learning_rate'],
+        batch_size=RECIPE['batch_size'], seed=RECIPE['seed'],
+        training_control=binding['training_control'],
+        selection_metric='pooled_validation_new_pixel_day_AP_max',
+        selection_tie_rule='earliest_epoch')
+    for key, value in expected.items():
+        if key not in configuration or configuration[key] != value:
+            raise ValueError('Completion configuration differs from bound recipe: ' + key)
+        if key not in selection or selection[key] != value:
+            raise ValueError('Completed selection differs from bound recipe: ' + key)
+    return validate_completion(diagnostic, selection, history, binding['epochs'],
+                               binding['training_control'])
+
+
 def _check_own_det(directory, binding):
     if not (directory / 'portable_completed.json').is_file():
         raise ValueError('Diff preflight waits for the completed Det in the SAME run-dir/profile')
     receipt = read_json(directory / 'portable_completed.json')
-    if (receipt.get('schema_version') != 'fwt_portable_training_completed_v1'
+    if (receipt.get('schema_version') != 'fwt_portable_training_completed_v2'
             or receipt.get('status') != 'completed' or receipt.get('phase') != 'det'
             or receipt.get('binding') != binding):
         raise ValueError('Diff requires its own completed Det with identical data/source/budget')
     files = receipt.get('files', {})
-    for name in ('best.pth', 'selection.json', 'diagnostics.json', 'history.json', 'configuration.json'):
+    for name in COMPLETION_FILES:
         if files.get(name) != file_sha256(directory / name):
             raise ValueError('Own Det completion artifact changed: ' + name)
-    diagnostic = read_json(directory / 'diagnostics.json')
-    selection = read_json(directory / 'selection.json')
-    if (diagnostic.get('status') != 'completed'
-            or diagnostic.get('completed_epochs') != binding['epochs']
-            or selection.get('selection_frozen') is not True):
-        raise ValueError('Own Det selection is not fully completed and frozen')
+    if receipt.get('completion') != _validated_completion(directory, binding, 'det'):
+        raise ValueError('Own Det completion summary differs from verified history')
     return directory / 'best.pth'
 
 
 def preflight(args):
     if args.cpu_threads < 1 or not re.fullmatch(r'cpu|cuda(?::\d+)?', args.device):
         raise ValueError('Use positive CPU threads and cpu/cuda/cuda:N')
-    if args.epochs not in (2, 30) or args.phase not in ('det', 'diff'):
-        raise ValueError('Only the fixed 30-epoch recipe or isolated 2-epoch smoke is supported')
+    if args.epochs not in PROFILES or args.phase not in ('det', 'diff'):
+        raise ValueError('Use adaptive maximum 100, fixed legacy 30, or isolated smoke 2 epochs')
     root, run_root = args.data_root.resolve(), args.run_dir.resolve()
     if root == run_root or root in run_root.parents or run_root in root.parents:
         raise ValueError('Data and output directories must be disjoint')
@@ -212,7 +237,7 @@ def preflight(args):
     if counts != bundle['role_counts']:
         raise ValueError('Bundle role counts differ from actual metadata')
     _check_array_index(read_json(files['arrays_index']), manifest, root)
-    if args.epochs == 30:
+    if args.epochs != 2:
         if counts != FULL_COUNTS or bundle.get('purpose') == 'smoke':
             raise ValueError('Formal training requires the complete 3197/811/568 development bundle')
         expected_ids = {r['sample_id'] for r in original['samples'] if r['role'] in DEVELOPMENT_ROLES}
@@ -222,14 +247,15 @@ def preflight(args):
         read_json(bound_file(root, bundle['original_normalizer'])), config, manifest,
         bundle['files']['weather']['sha256'])
     sources = PortableSources(files['weather'])
-    profile = 'formal' if args.epochs == 30 else 'smoke-2ep'
+    profile = PROFILES[args.epochs]
     output = run_root / profile / args.phase
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise FileExistsError('Fresh phase output is required; choose a new --run-dir')
     binding = dict(source_sha256=source_digest(), entry_sha256=file_sha256(__file__),
         bundle_sha256=file_sha256(bundle_path),
         files={name: file_sha256(path) for name, path in files.items()},
-        epochs=args.epochs, profile=profile, recipe=RECIPE)
+        epochs=args.epochs, profile=profile, recipe=RECIPE,
+        training_control=policy_for_epochs(args.epochs))
     backbone = _check_own_det(run_root / profile / 'det', binding) if args.phase == 'diff' else None
     return dict(schema_version='fwt_portable_preflight_v1', status='passed',
         phase=args.phase, profile=profile, training_started=False, heldout_evaluation=False,
@@ -267,23 +293,16 @@ def execute(args, checked):
         output=checked['output'], epochs=args.epochs, batch_size=1, learning_rate=.001,
         seed=0, device=args.device, loss='focal', samples=8, sampling_steps=4,
         sampler='ddim', architecture='fwt', backbone=checked['backbone'],
-        resume=None, stop_after_epoch=None)
+        resume=None, stop_after_epoch=None, training_control=checked['binding']['training_control'])
     try:
         with _working_directory(checked['data_root']):
             result = engine.train(train_args, read_json(checked['config_path']), args.phase)
         output = Path(checked['output'])
-        diagnostic = read_json(output / 'diagnostics.json')
-        selection = read_json(output / 'selection.json')
-        if (diagnostic.get('status') != 'completed'
-                or diagnostic.get('completed_epochs') != args.epochs
-                or selection.get('selection_frozen') is not True):
-            raise RuntimeError('Engine did not finish the requested frozen selection')
-        names = ('best.pth', 'last.pth', 'selection.json', 'diagnostics.json',
-                 'history.json', 'configuration.json', 'validation_selected.json')
-        receipt = dict(schema_version='fwt_portable_training_completed_v1', status='completed',
+        completion = _validated_completion(output, checked['binding'], args.phase)
+        receipt = dict(schema_version='fwt_portable_training_completed_v2', status='completed',
             phase=args.phase, binding=checked['binding'],
-            smoke_only=args.epochs != 30, heldout_evaluation=False,
-            files={name: file_sha256(output / name) for name in names}, result=result)
+            smoke_only=args.epochs == 2, heldout_evaluation=False, completion=completion,
+            files={name: file_sha256(output / name) for name in COMPLETION_FILES}, result=result)
         artifacts.atomic_json(output / 'portable_completed.json', receipt)
         return receipt
     finally:
