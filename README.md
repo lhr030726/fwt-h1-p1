@@ -108,6 +108,26 @@ python train.py --phase diff --device cuda --data-root data --run-dir runs/h1p1 
 
 P1 只读取同一运行的 `runs/h1p1/formal/det/best.pth`，完成校验后冻结该骨干，再训练扩散头。结果分别位于 `runs/h1p1/formal/det/` 和 `runs/h1p1/formal/diff/`。入口不自动重试或串联下一阶段；已有非空输出不会被覆盖。新实验请选择新的 `--run-dir`，失败则保留现场并先检查回执。
 
+## 可选的资源利用率实验
+
+此分支提供 CPU 样本缓存和显式批量参数。默认仍是训练 `batch_size=1`、验证批量跟随训练批量、样本缓存关闭；地理基底缓存保留最多 1,024 个网格。它们是待实测的性能设置，不表示预测质量已经改善。
+
+`--sample-cache-gib 40` 让训练与验证共享一个最多保留 40 GiB 张量存储的 CPU 缓存。首次取样仍走原始 Dataset 读取与派生计算，天气来源验证在 Dataset 构造时完成；后续命中复用确定性计算结果，返回值独立复制，避免调用者修改缓存。当前完整开发数据的张量净大小估计约 33.52 GiB，实际进程内存还包括地理基底、临时张量、验证预测及分配器开销。缓存不是总内存上限，保持 `num_workers=0`，也不会主动填满显存。每轮的 `diagnostics.json` 会记录缓存命中、逐出和净字节。
+
+仅启用缓存、保持 batch=1 的示例（先完成新环境演练与性能/等价性检查，再使用全新输出目录）：
+
+```bash
+python train.py --phase det --device cuda --data-root data \
+  --run-dir runs/h1p1-cached --sample-cache-gib 40 --execute
+# 等该 H1 完成后，以相同资源设置启动它自己的 P1：
+python train.py --phase diff --device cuda --data-root data \
+  --run-dir runs/h1p1-cached --sample-cache-gib 40 --execute
+```
+
+`--batch-size N` 是训练配方变体：它改变每轮优化器更新次数和梯度聚合，不能仅因显卡空闲就视作原 batch=1 配方的等价加速。`--validation-batch-size N` 可单独设置验证批量；需核对预测与指标的数值差异。两项批量均为 1–128，缓存预算为 0–64 GiB。实际设置写入预检、检查点和完成回执，H1/P1 的绑定必须一致；不能用改过设置的新 P1 冒充原 H1 配套运行。
+
+用 `scripts/benchmark_geography_cache.py` 核验地理缓存输出与 CPU 时间；`scripts/benchmark_batches.py` 默认只输出计划，显式执行时要求 GPU 空闲，测量的是合成输入下的计算容量。正式采用配置还应比较实际数据的稳定 samples/s、峰值内存、梯度和完整验证表现。原始数组、归一化、天气来源核验和每轮输入/源码检查仍保留。
+
 ## 数据与结果边界
 
 - 次日目标、事件角色、Tb 归一化及天气来源固定；不使用验证/测试数据重新拟合统计或重新划分数据。

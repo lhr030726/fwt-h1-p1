@@ -276,7 +276,9 @@ def train(args, config, family):
     cache_gib = getattr(args, 'sample_cache_gib', 0.)
     if not math.isfinite(cache_gib) or not 0 <= cache_gib <= 64:
         raise ValueError('Sample cache must be a finite budget from 0 to 64 GiB')
-    validation_batch_size = getattr(args, 'validation_batch_size', None) or args.batch_size
+    validation_batch_size = getattr(args, 'validation_batch_size', None)
+    if validation_batch_size is None:
+        validation_batch_size = args.batch_size
     if type(validation_batch_size) is not int or validation_batch_size < 1:
         raise ValueError('Validation batch size must be a positive integer')
     sample_cache = None

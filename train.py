@@ -191,7 +191,7 @@ def _check_own_det(directory, binding):
 def preflight(args):
     if args.cpu_threads < 1 or not re.fullmatch(r'cpu|cuda(?::\d+)?', args.device):
         raise ValueError('Use positive CPU threads and cpu/cuda/cuda:N')
-    validation_batch_size = args.validation_batch_size or args.batch_size
+    validation_batch_size = args.batch_size if args.validation_batch_size is None else args.validation_batch_size
     if (not 1 <= args.batch_size <= 128 or
             (args.validation_batch_size is not None and not 1 <= args.validation_batch_size <= 128)):
         raise ValueError('Training and validation batch sizes must be between 1 and 128')
