@@ -170,6 +170,66 @@ class PortableTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     train.preflight(args)
 
+    def test_zero_variant_bound_without_changing_the_bundle(self):
+        args = self.f.args()
+        original = train.preflight(args)
+        args.p1_zero_init = True
+        changed = train.preflight(args)
+        self.assertEqual(original['binding']['recipe']['p1_output_initialization'], 'random')
+        self.assertEqual(changed['binding']['recipe']['p1_output_initialization'], 'zero')
+        self.assertEqual(original['binding']['files'], changed['binding']['files'])
+        self.assertEqual(train.read_json(changed['config_path'])['diffusion'], train.DIFFUSION)
+        args.execute = True
+        with self.assertRaisesRegex(ValueError, 'unchanged preflight'):
+            train.execute(args, original)
+        self.f.config['diffusion'] = dict(train.DIFFUSION, output_initialization='zero')
+        self.f.refresh()
+        with self.assertRaisesRegex(ValueError, 'frozen H1/P1'):
+            train.preflight(args)
+
+    def test_zero_variant_forwarded_to_both_stages_after_immutable_config_check(self):
+        args = self.f.args()
+        args.p1_zero_init = args.execute = True
+        before = (self.f.data / 'config.h1.json').read_bytes()
+        fake_torch, fake_engine, fake_artifacts = (ModuleType(name) for name in
+            ('torch', 'fwt_v2.engine', 'fwt_v2.artifacts'))
+        fake_torch.set_num_threads = lambda count: None
+        fake_artifacts.WORKSPACE = self.root
+        fake_artifacts.atomic_json = write_json
+        calls = []
+
+        def run(arguments, configuration, family):
+            calls.append((family, copy.deepcopy(configuration)))
+            output = Path(arguments.output)
+            output.mkdir(parents=True)
+            for name in ('best.pth', 'last.pth'):
+                (output / name).write_bytes(b'synthetic checkpoint placeholder')
+            write_json(output / 'diagnostics.json', dict(status='completed', completed_epochs=2))
+            write_json(output / 'selection.json', dict(selection_frozen=True))
+            for name in ('history.json', 'configuration.json', 'validation_selected.json'):
+                write_json(output / name, {})
+            return dict(family=family)
+
+        fake_engine.train = run
+        import fwt_v2
+        with patch.dict(sys.modules, {'torch': fake_torch, 'fwt_v2.engine': fake_engine,
+                                     'fwt_v2.artifacts': fake_artifacts}), \
+                patch.object(fwt_v2, 'engine', fake_engine, create=True), \
+                patch.object(fwt_v2, 'artifacts', fake_artifacts, create=True):
+            det = train.execute(args, train.preflight(args))
+            args.phase = 'diff'
+            args.p1_zero_init = False
+            with self.assertRaisesRegex(ValueError, 'identical data/source/budget'):
+                train.preflight(args)
+            args.p1_zero_init = True
+            diff = train.execute(args, train.preflight(args))
+        self.assertEqual(det['binding'], diff['binding'])
+        self.assertEqual([family for family, _ in calls], ['det', 'diff'])
+        for _, config in calls:
+            self.assertEqual(config['diffusion'], dict(train.DIFFUSION, output_initialization='zero'))
+            self.assertEqual(config['model'], train.MODEL)
+        self.assertEqual(before, (self.f.data / 'config.h1.json').read_bytes())
+
     def test_swapped_input_label_pairing_rejected_by_published_index(self):
         first, second = self.f.rows[:2]
         first['label_path'], second['label_path'] = second['label_path'], first['label_path']

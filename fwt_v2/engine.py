@@ -316,6 +316,8 @@ def train(args, config, family):
         if family == 'diff':
             provenance['prediction_type'] = diffusion_config.prediction_type
             provenance['training_timestep_sampling'] = diffusion_config.training_timestep_sampling
+            if diffusion_config.output_initialization == 'zero':
+                provenance['initialization'] = 'new_random_initialization_zero_output'
     provenance['parameters'] = dict(optimized=sum(p.numel() for p in model.parameters()),
                                    trainable=sum(p.numel() for p in model.parameters() if p.requires_grad),
                                    backbone=sum(p.numel() for p in backbone.parameters()))
@@ -347,6 +349,7 @@ def train(args, config, family):
     if family == 'diff':
         diagnostics['prediction_type'] = diffusion_config.prediction_type
         diagnostics['training_timestep_sampling'] = diffusion_config.training_timestep_sampling
+        diagnostics['output_initialization'] = diffusion_config.output_initialization
         diagnostics.update(total_diffusion_timestep_exposures=0,
                            total_diffusion_denoiser_evaluations=0, total_diffusion_noise_draws=0)
     if head is not None:

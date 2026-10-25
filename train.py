@@ -52,6 +52,8 @@ def parser():
     result.add_argument('--cpu-threads', type=int, default=2)
     result.add_argument('--batch-size', type=int, default=1,
                         help='Explicit training recipe variant; use the same value for H1 and P1')
+    result.add_argument('--p1-zero-init', action='store_true',
+                        help='Zero P1 final correction layer after normal construction; set for BOTH H1 and P1')
     result.add_argument('--validation-batch-size', type=int, default=None,
                         help='Validation batching; defaults to training batch size')
     result.add_argument('--sample-cache-gib', type=float, default=0.,
@@ -241,7 +243,8 @@ def preflight(args):
     binding = dict(source_sha256=source_digest(), entry_sha256=file_sha256(__file__),
         bundle_sha256=file_sha256(bundle_path),
         files={name: file_sha256(path) for name, path in files.items()},
-        epochs=args.epochs, profile=profile, recipe=dict(RECIPE, batch_size=args.batch_size),
+        epochs=args.epochs, profile=profile, recipe=dict(RECIPE, batch_size=args.batch_size,
+            p1_output_initialization='zero' if args.p1_zero_init else 'random'),
         performance=dict(sample_cache_gib=args.sample_cache_gib,
                          validation_batch_size=validation_batch_size, num_workers=0))
     backbone = _check_own_det(run_root / profile / 'det', binding) if args.phase == 'diff' else None
@@ -285,8 +288,13 @@ def execute(args, checked):
         sampler='ddim', architecture='fwt', backbone=checked['backbone'],
         resume=None, stop_after_epoch=None)
     try:
+        # The on-disk bundle remains immutable and was checked twice above. Bind
+        # this opt-in variant in both stages, then modify only this in-memory copy.
+        configuration = read_json(checked['config_path'])
+        if checked['binding']['recipe']['p1_output_initialization'] == 'zero':
+            configuration['diffusion'] = dict(configuration['diffusion'], output_initialization='zero')
         with _working_directory(checked['data_root']):
-            result = engine.train(train_args, read_json(checked['config_path']), args.phase)
+            result = engine.train(train_args, configuration, args.phase)
         output = Path(checked['output'])
         diagnostic = read_json(output / 'diagnostics.json')
         selection = read_json(output / 'selection.json')

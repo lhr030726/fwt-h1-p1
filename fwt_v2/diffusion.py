@@ -34,6 +34,7 @@ class DiffusionConfig:
     condition_mode: str = "multiscale"
     prediction_type: str = "epsilon"
     training_timestep_sampling: str = "uniform"
+    output_initialization: str = "random"
 
     def __post_init__(self):
         if not isinstance(self.timesteps, int) or self.timesteps < 2:
@@ -49,6 +50,10 @@ class DiffusionConfig:
             raise ValueError("prediction_type must be epsilon, v or clean_probability")
         if self.training_timestep_sampling not in {"uniform", "antithetic"}:
             raise ValueError("training_timestep_sampling must be uniform or antithetic")
+        if self.output_initialization not in {"random", "zero"}:
+            raise ValueError("output_initialization must be random or zero")
+        if self.output_initialization == "zero" and self.prediction_type != "clean_probability":
+            raise ValueError("zero output initialization requires clean_probability")
 
 
 def _normal(shape, like, generator=None):
@@ -147,6 +152,11 @@ class ConditionalResidualDiffusion(nn.Module):
         }
         for name, value in values.items():
             self.register_buffer(name, value.float())
+        if self.config.output_initialization == "zero":
+            # Construct normally first, preserving every constructor RNG draw.
+            # The initial clean-logit correction is zero; it is not a checkpoint candidate.
+            nn.init.zeros_(self.denoiser.output.weight)
+            nn.init.zeros_(self.denoiser.output.bias)
 
     @property
     def terminal_snr(self):
@@ -366,6 +376,8 @@ class DeterministicResidualHead(nn.Module):
     def __init__(self, config: Optional[DiffusionConfig] = None):
         super().__init__()
         self.config = config or DiffusionConfig()
+        if self.config.output_initialization != "random":
+            raise ValueError("zero output initialization is only supported by the diffusion head")
         self.denoiser = _ConditionalUNet(self.config)
 
     def forward(self, outputs, physics):
