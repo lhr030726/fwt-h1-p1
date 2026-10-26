@@ -38,7 +38,22 @@ PARENT_AP = .26120831547850837
 RESERVE_BYTES = 256 * 1024**2
 read_json, sha, canonical_sha = pilot.read_json, pilot.sha, pilot.canonical_sha
 serialize_state, deserialize_state = pilot.serialize_state, pilot.deserialize_state
-tensor_cpu_tree = pilot.tensor_cpu_tree
+
+
+def tensor_cpu_tree(value):
+    """Own every saved tensor, including AdamW's already-CPU step scalars.
+
+    This matches the frozen helper's cloning semantics explicitly. Moving a
+    tensor to CPU alone is not a snapshot when that tensor already lives there.
+    """
+    import torch
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {key: tensor_cpu_tree(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return type(value)(tensor_cpu_tree(item) for item in value)
+    return deepcopy(value)
 
 
 def require(condition, message):
@@ -225,6 +240,15 @@ def migrate_optimizer_lr(optimizer, arm):
         source_lr=1e-4, target_lr=LEARNING_RATES[arm])
 
 
+def restore_parent_state(state, model, optimizer, binding, device, parent_history):
+    """Verify the frozen schema, giving AdamW exclusively owned tensor copies.
+
+    Optimizer.load_state_dict may retain input tensor references (notably in
+    PyTorch 2.7). Never hand it the shared parent checkpoint or an audit snapshot.
+    """
+    extension.restore_state(deepcopy(state), model, optimizer, binding, device, parent_history)
+
+
 def make_state(model, optimizer, binding, history, baseline, device):
     from fwt_v2.engine import model_state_digest
     from fwt_v2.training_state import capture_rng, optimizer_state_integrity
@@ -275,7 +299,8 @@ def restore_state(state, model, optimizer, binding, device):
     from fwt_v2.training_state import restore_training_parameters, validate_rng, restore_rng
     check_state(state, binding['branch_id'], binding)
     validate_rng(state['rng_state'], device)
-    restore_training_parameters(dict(state, selected={'state_dict': state['model_state_dict']}), model, optimizer)
+    owned = deepcopy(state)
+    restore_training_parameters(dict(owned, selected={'state_dict': owned['model_state_dict']}), model, optimizer)
     require(model_state_digest(model) == state['model_state_sha256'], 'Restored model digest differs')
     restore_rng(state['rng_state'], device)
 
@@ -587,13 +612,13 @@ def execute(args, plan):
     template_optimizer = torch.optim.AdamW(template.parameters(), lr=1e-4, weight_decay=.01)
     require(canonical_sha(template_optimizer.defaults) == canonical_sha(original['optimizer_defaults']),
             'Original AdamW defaults differ')
-    extension.restore_state(parent_state, template, template_optimizer, original, device, parent_history)
+    restore_parent_state(parent_state, template, template_optimizer, original, device, parent_history)
     parent_head = deepcopy(template).requires_grad_(False).eval()
     heads, optimizers, migrations = {}, {}, {}
     for arm in ARMS:
         heads[arm] = deepcopy(template)
         optimizers[arm] = torch.optim.AdamW(heads[arm].parameters(), lr=1e-4, weight_decay=.01)
-        extension.restore_state(parent_state, heads[arm], optimizers[arm], original, device, parent_history)
+        restore_parent_state(parent_state, heads[arm], optimizers[arm], original, device, parent_history)
         migrations[arm] = migrate_optimizer_lr(optimizers[arm], arm)
         require(model_state_digest(heads[arm]) == plan['parent_model_sha256'], 'Branch failed exact model restoration')
     del template, template_optimizer, parent_decoded, transaction

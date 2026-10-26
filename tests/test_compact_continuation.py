@@ -56,7 +56,7 @@ def fork_fixture():
     for arm in runner.ARMS:
         head = torch.nn.Linear(3, 1)
         optimizer = torch.optim.AdamW(head.parameters(), lr=1e-4, weight_decay=.01)
-        runner.extension.restore_state(parent, head, optimizer, parent_binding, 'cpu', parent['history'][:10])
+        runner.restore_parent_state(parent, head, optimizer, parent_binding, 'cpu', parent['history'][:10])
         migrations[arm] = runner.migrate_optimizer_lr(optimizer, arm)
         binding = dict(branch_id=arm, architecture_arm='compact_bce', seed=4,
             parent_checkpoint_sha256='original-best49', optimizer_param_groups=deepcopy(optimizer.state_dict()['param_groups']))
@@ -164,6 +164,61 @@ class ContinuationTests(unittest.TestCase):
             if arm == 'constant_lr':
                 self.assertTrue(all(v['step'].item() == 2499 for v in optimizers['lower_lr'].state.values()))
         self.assertNotEqual(model_state_digest(heads['constant_lr']), model_state_digest(heads['lower_lr']))
+
+    def test_restore_ownership_even_if_optimizer_retains_input_tensor_references(self):
+        # Emulate the ownership behavior seen on the remote PyTorch 2.7 runtime
+        # even when this test runs on a version whose loader deep-copies inputs.
+        original_load = torch.optim.AdamW.load_state_dict
+
+        def retaining_load(optimizer, saved):
+            result = original_load(optimizer, saved)
+            for serialized, group in zip(saved['param_groups'], optimizer.param_groups):
+                for identity, parameter in zip(serialized['params'], group['params']):
+                    if identity in saved['state']:
+                        optimizer.state[parameter] = saved['state'][identity]
+            return result
+
+        with patch.object(torch.optim.AdamW, 'load_state_dict', retaining_load):
+            parent, heads, optimizers, bindings, _, transaction = fork_fixture()
+            parent_integrity = optimizer_state_integrity(parent['optimizer_state_dict'])
+            parent_tensors = deepcopy(parent['optimizer_state_dict']['state'])
+            decoded = runner.restore_transaction(transaction, heads, optimizers, bindings, 'cpu')
+            snapshot = runner.make_state(heads['constant_lr'], optimizers['constant_lr'],
+                bindings['constant_lr'], [], decoded['constant_lr']['last']['baseline_validation'], 'cpu')
+            snapshot_integrity = optimizer_state_integrity(snapshot['optimizer_state_dict'])
+            decoded_integrity = {arm: {kind: optimizer_state_integrity(state['optimizer_state_dict'])
+                for kind, state in states.items()} for arm, states in decoded.items()}
+            other_integrity = optimizer_state_integrity(optimizers['lower_lr'].state_dict())
+            for arm in runner.ARMS:
+                live = optimizers[arm].state_dict()['state']
+                for identity, tensors in live.items():
+                    for key, tensor in tensors.items():
+                        self.assertNotEqual(tensor.data_ptr(), parent['optimizer_state_dict']['state'][identity][key].data_ptr())
+                        self.assertNotEqual(tensor.data_ptr(), decoded[arm]['last']['optimizer_state_dict']['state'][identity][key].data_ptr())
+                        if arm == 'constant_lr':
+                            self.assertNotEqual(tensor.data_ptr(), snapshot['optimizer_state_dict']['state'][identity][key].data_ptr())
+            for left, right in zip(optimizers['constant_lr'].state.values(), optimizers['lower_lr'].state.values()):
+                for key in left:
+                    self.assertNotEqual(left[key].data_ptr(), right[key].data_ptr())
+            step(heads['constant_lr'], optimizers['constant_lr'])
+            self.assertTrue(all(v['step'].item() == 2500 for v in optimizers['constant_lr'].state.values()))
+            self.assertTrue(all(v['step'].item() == 2499 for v in optimizers['lower_lr'].state.values()))
+            self.assertEqual(optimizer_state_integrity(optimizers['lower_lr'].state_dict()), other_integrity)
+            self.assertEqual(optimizer_state_integrity(parent['optimizer_state_dict']), parent_integrity)
+            self.assertEqual(optimizer_state_integrity(snapshot['optimizer_state_dict']), snapshot_integrity)
+            for identity, tensors in parent_tensors.items():
+                for key, tensor in tensors.items():
+                    self.assertTrue(torch.equal(tensor, parent['optimizer_state_dict']['state'][identity][key]))
+            for arm, states in decoded.items():
+                for kind, state in states.items():
+                    self.assertEqual(optimizer_state_integrity(state['optimizer_state_dict']), decoded_integrity[arm][kind])
+            # Reusing the same authoritative transaction must still restore an
+            # unmodified 2499-step checkpoint, including on a second resume.
+            runner.restore_transaction(transaction, heads, optimizers, bindings, 'cpu')
+            for arm in runner.ARMS:
+                self.assertTrue(all(v['step'].item() == 2499 for v in optimizers[arm].state.values()))
+                step(heads[arm], optimizers[arm])
+                self.assertTrue(all(v['step'].item() == 2500 for v in optimizers[arm].state.values()))
 
     def test_parent_fallback_and_new_only_best_are_distinct(self):
         _, heads, optimizers, bindings, _, transaction = fork_fixture()
