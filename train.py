@@ -63,6 +63,10 @@ def parser():
                         help='Completed original H1 run for an additional segment with a fresh optimizer; set BOTH stages')
     result.add_argument('--warm-start-h1-source-tree', type=Path,
                         help='Preserved original source tree for strict compatibility verification')
+    result.add_argument('--continuation-manifest', type=Path,
+                        help='Reviewed source migration and immutable full-epoch state; set for both stages')
+    result.add_argument('--resume-training-state', type=Path,
+                        help='Restore the exact saved model, AdamW, RNG, history and total epoch budget')
     result.add_argument('--h1-epochs', type=int, choices=(2, 30, 60), default=None)
     result.add_argument('--p1-epochs', type=int, choices=(2, 30, 60), default=None)
     result.add_argument('--validation-batch-size', type=int, default=None,
@@ -301,6 +305,23 @@ def _check_warm_start_det(run_root, source_tree, binding, manifest, config):
 
 
 def preflight(args):
+    continuation = None
+    continuation_manifest = getattr(args, 'continuation_manifest', None)
+    resume_state = getattr(args, 'resume_training_state', None)
+    if resume_state is not None and continuation_manifest is None:
+        raise ValueError('Portable resume requires an explicit continuation manifest')
+    if continuation_manifest is not None:
+        from fwt_v2.source_resume import verify_manifest, verify_runtime_parallelism
+        continuation = verify_manifest(continuation_manifest)
+        verify_runtime_parallelism(continuation['evidence'])
+        checkpoint = continuation['document']['checkpoint']
+        if resume_state is not None and (Path(resume_state).resolve() != Path(checkpoint['path']).resolve()
+                                        or args.phase != checkpoint['phase']):
+            raise ValueError('Resume phase/path differs from the continuation manifest')
+        if args.phase == checkpoint['phase'] and resume_state is None:
+            raise ValueError('Saved phase requires --resume-training-state; never restart it from zero')
+        if args.warm_start_h1_run is not None or args.warm_start_h1_source_tree is not None:
+            raise ValueError('Continuation restores saved initialization; omit fresh warm-start flags')
     if args.cpu_threads < 1 or not re.fullmatch(r'cpu|cuda(?::\d+)?', args.device):
         raise ValueError('Use positive CPU threads and cpu/cuda/cuda:N')
     validation_batch_size = args.batch_size if args.validation_batch_size is None else args.validation_batch_size
@@ -377,6 +398,9 @@ def preflight(args):
     if args.h1_epochs is not None or args.p1_epochs is not None:
         binding['stage_epochs'] = budgets
     backbone = None
+    if continuation is not None:
+        from fwt_v2.source_resume import bind_entry
+        binding = bind_entry(binding, continuation, args.phase)
     if external is not None:
         binding['warm_start_h1'] = _check_warm_start_det(external,
             args.warm_start_h1_source_tree.resolve(), binding, manifest, config)
@@ -417,12 +441,14 @@ def execute(args, checked):
     train_args = SimpleNamespace(manifest=checked['manifest'], normalizer=checked['normalizer'],
         output=checked['output'], epochs=args.epochs, batch_size=args.batch_size,
         learning_rate=args.p1_learning_rate if args.phase == 'diff' else args.h1_learning_rate,
-        warm_start_h1=checked['binding'].get('warm_start_h1') if args.phase == 'det' else None,
+        warm_start_h1=(checked['binding'].get('warm_start_h1') if args.phase == 'det'
+                       and not getattr(args, 'resume_training_state', None) else None),
         validation_batch_size=checked['binding']['performance']['validation_batch_size'],
         sample_cache_gib=args.sample_cache_gib,
         seed=0, device=args.device, loss='focal', samples=8, sampling_steps=4,
         sampler='ddim', architecture='fwt', backbone=checked['backbone'],
-        resume=None, stop_after_epoch=None)
+        resume=getattr(args, 'resume_training_state', None), stop_after_epoch=None,
+        continuation_manifest=getattr(args, 'continuation_manifest', None))
     try:
         # The on-disk bundle remains immutable and was checked twice above. Bind
         # this opt-in variant in both stages, then modify only this in-memory copy.
@@ -438,7 +464,11 @@ def execute(args, checked):
                 or diagnostic.get('completed_epochs') != args.epochs
                 or selection.get('selection_frozen') is not True):
             raise RuntimeError('Engine did not finish the requested frozen selection')
-        if 'warm_start_h1' in checked['binding']:
+        if 'continuation' in checked['binding']:
+            from fwt_v2.source_resume import verify_manifest
+            if verify_manifest(args.continuation_manifest)['evidence'] != checked['binding']['continuation']:
+                raise RuntimeError('Continuation evidence changed during training')
+        elif 'warm_start_h1' in checked['binding']:
             lineage = _check_warm_start_det(args.warm_start_h1_run.resolve(),
                 args.warm_start_h1_source_tree.resolve(), checked['binding'],
                 read_json(checked['manifest']), read_json(checked['config_path']))

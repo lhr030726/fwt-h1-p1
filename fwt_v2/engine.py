@@ -289,6 +289,14 @@ def train(args, config, family):
     if stop_after is not None and (type(stop_after) is not int or not 1 <= stop_after < args.epochs):
         raise ValueError('stop-after-epoch must be positive and below the unchanged total epoch budget')
     resume_path = getattr(args, 'resume', None)
+    continuation_manifest = getattr(args, 'continuation_manifest', None)
+    resume_snapshot = None
+    if continuation_manifest is not None and resume_path is not None:
+        from .source_resume import read_snapshot
+        resume_snapshot = read_snapshot(resume_path, continuation_manifest, family)
+    elif continuation_manifest is not None:
+        from .source_resume import verify_manifest, verify_runtime_parallelism
+        verify_runtime_parallelism(verify_manifest(continuation_manifest)['evidence'])
     warm_lineage = getattr(args, 'warm_start_h1', None)
     if warm_lineage is not None and (family != 'det' or resume_path is not None):
         raise ValueError('Selected H1 weight warm-start requires det without optimizer resume')
@@ -400,9 +408,16 @@ def train(args, config, family):
     provenance['manifest_file_sha256'] = sha256(args.manifest)
     # Explicit defaults bind AdamW's actual recipe, not merely its class name.
     provenance['optimizer_defaults'] = deepcopy(optimizer.defaults)
+    if resume_snapshot is not None:
+        from .source_resume import inherit_initialization
+        inherit_initialization(provenance, resume_snapshot)
     samples = train_loader.dataset.samples + val_loader.dataset.samples
     binding = training_binding(provenance, config, sampling, samples)
-    restart = load_training_state(resume_path, binding) if resume_path else None
+    if resume_snapshot is not None:
+        from .source_resume import migrate_snapshot
+        restart = migrate_snapshot(resume_snapshot, binding)
+    else:
+        restart = load_training_state(resume_path, binding) if resume_path else None
     start_epoch = restart['completed_epochs'] if restart else 0
     if stop_after is not None and stop_after <= start_epoch:
         raise ValueError('Controlled stop must be later than the restored completed epoch')
@@ -577,6 +592,7 @@ def train(args, config, family):
         validation_sample_ids=provenance['validation_sample_ids'], sampling=provenance['sampling'],
         selection_metric=provenance['selection_metric'], selection_tie_rule=provenance['selection_tie_rule'],
         raw_threshold=selected['raw_threshold'], raw_threshold_rule=selected['raw_threshold_rule'],
+        **{key: selected[key] for key in ('source_migration', 'selection_origin') if key in selected},
         **selected_validation))
     diagnostics.update(status='completed', wall_seconds=time.perf_counter() - started,
                        completed_epochs=args.epochs, remaining_epochs=0, selection_frozen=True,
