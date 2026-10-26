@@ -151,6 +151,19 @@ def corrected_logits(head, arm, outputs, parent_logits, batch):
     return head(outputs, parent_logits, delta, batch['history_valid'])
 
 
+def history_to_device(batch, device):
+    """Extend the frozen engine's explicit device transfer for new inputs.
+
+    Keep reporting metadata (including its CPU domain mask) under the original
+    engine contract, while moving every tensor consumed by the history branch.
+    """
+    from fwt_v2.engine import to_device
+    moved = to_device(batch, device)
+    moved['history_delta'] = batch['history_delta'].to(device)
+    moved['history_valid'] = batch['history_valid'].to(device)
+    return moved
+
+
 def make_state(head, optimizer, binding, history, baseline, device):
     from fwt_v2.engine import model_state_digest
     from fwt_v2.training_state import capture_rng, optimizer_state_integrity
@@ -277,7 +290,7 @@ def write_status(args, phase, **details):
 def validation_records(backbone, parent, heads, loader, device, include_parent=False,
                        require_parent_equal=False, collect_heads=True):
     import torch
-    from fwt_v2.engine import records_from_batch, to_device
+    from fwt_v2.engine import records_from_batch
     backbone.eval(); parent.eval()
     for head in heads.values():
         head.eval()
@@ -286,7 +299,7 @@ def validation_records(backbone, parent, heads, loader, device, include_parent=F
         result['parent'] = []
     with torch.no_grad():
         for cpu_batch in loader:
-            batch = to_device(cpu_batch, device)
+            batch = history_to_device(cpu_batch, device)
             outputs = backbone(batch['x_norm'], batch['physics'], return_decoder_features=True)
             anchor = parent(outputs, batch['physics'])
             if include_parent:
@@ -359,8 +372,7 @@ def development_comparison(seed_receipts, baseline):
 
 def verify_zero_pair(backbone, parent, heads, cpu_batch, device):
     import torch
-    from fwt_v2.engine import to_device
-    batch = to_device(cpu_batch, device)
+    batch = history_to_device(cpu_batch, device)
     with torch.no_grad():
         outputs = backbone(batch['x_norm'], batch['physics'], return_decoder_features=True)
         anchor = parent(outputs, batch['physics'])
@@ -384,7 +396,7 @@ def run(args, plan):
     from fwt_v2.artifacts import atomic_json, output_path
     from fwt_v2.data import DataConfig, NormalizationStats, RCDADataset
     from fwt_v2.diffusion import DiffusionConfig
-    from fwt_v2.engine import audited_manifest, load_det, model_state_digest, seed_everything, to_device
+    from fwt_v2.engine import audited_manifest, load_det, model_state_digest, seed_everything
     from fwt_v2.gradient_diagnostics import gradients_finite, gradient_l2_norm
     from fwt_v2.history_refiner import load_history_arrays
     from fwt_v2.literature_refiner import masked_refinement_loss
@@ -515,7 +527,7 @@ def run(args, plan):
         heads, optimizers = probe_heads, probe_optimizers
         verify_zero_pair(backbone, parent, heads, first_batch, device)
         initial = {arm: model_state_digest(head) for arm, head in heads.items()}
-        batch = to_device(first_batch, device)
+        batch = history_to_device(first_batch, device)
         torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
         started = time.perf_counter()
         with torch.no_grad():
@@ -603,7 +615,7 @@ def run(args, plan):
             losses, norms, observed = {a: [] for a in ARMS}, {a: [] for a in ARMS}, []
             for batch_index, cpu_batch in enumerate(loader):
                 require(list(cpu_batch['sample_id']) == order[batch_index], 'Actual paired order differs')
-                batch = to_device(cpu_batch, device)
+                batch = history_to_device(cpu_batch, device)
                 with torch.no_grad():
                     outputs = backbone(batch['x_norm'], batch['physics'], return_decoder_features=True)
                     anchor = parent(outputs, batch['physics'])

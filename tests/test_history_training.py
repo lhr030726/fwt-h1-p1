@@ -56,6 +56,88 @@ def advance(heads, optimizers, bindings, transaction, ap=.25):
 
 
 class HistoryTrainingTests(unittest.TestCase):
+    def test_history_to_device_moves_all_computation_tensors_and_preserves_metadata(self):
+        batch = dict(x_norm=torch.ones(2, 22, 8, 8), target=torch.ones(2, 1, 8, 8),
+            valid_mask=torch.ones(2, 1, 8, 8), domain_mask=torch.ones(2, 1, 8, 8),
+            physics={'distance': torch.zeros(2, 1, 8, 8)},
+            history_delta=torch.ones(2, 1, 8, 8, dtype=torch.float32),
+            history_valid=torch.ones(2, 1, 8, 8, dtype=torch.bool),
+            sample_id=['first', 'second'], event_id=['event-a', 'event-b'])
+        moved = runner.history_to_device(batch, 'meta')
+        for key in ('x_norm', 'target', 'valid_mask', 'history_delta', 'history_valid'):
+            self.assertEqual(moved[key].device.type, 'meta')
+            self.assertEqual(moved[key].shape, batch[key].shape)
+            self.assertEqual(moved[key].dtype, batch[key].dtype)
+            self.assertEqual(batch[key].device.type, 'cpu')
+        self.assertEqual(moved['physics']['distance'].device.type, 'meta')
+        self.assertIs(moved['sample_id'], batch['sample_id'])
+        self.assertIs(moved['event_id'], batch['event_id'])
+        self.assertIs(moved['domain_mask'], batch['domain_mask'])  # Frozen engine reporting contract.
+
+    @unittest.skipUnless(torch.cuda.is_available(), 'Synthetic integration requires CUDA')
+    def test_cuda_history_dataset_transfer_forward_backward_records_and_missing_fallback(self):
+        from torch.utils.data import DataLoader
+        from fwt_v2.literature_refiner import DecoderFeatureRefiner, masked_refinement_loss
+        torch.manual_seed(4)
+        samples = [dict(x_norm=torch.randn(22, 16, 16), target=torch.zeros(1, 16, 16),
+            valid_mask=torch.ones(1, 16, 16), domain_mask=torch.ones(1, 16, 16),
+            physics={'distance': torch.zeros(1, 16, 16)}, sample_id=f'sample-{i}', event_id=f'event-{i}') for i in range(2)]
+        for sample in samples:
+            sample['target'][:, 4:8, 4:8] = 1.
+        delta = np.zeros((2, 1, 16, 16), dtype=np.float32)
+        valid = np.zeros((2, 1, 16, 16), dtype=np.bool_)
+        delta[1, :, 3:7, 3:7] = 1.
+        valid[1, :, :12, :] = True
+        dataset = runner.HistoryDataset(samples, dict(history_delta=delta, history_valid=valid))
+        loader = DataLoader(dataset, batch_size=2, shuffle=False)
+        cpu_batch = next(iter(loader))
+
+        class Backbone(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.scale = torch.nn.Parameter(torch.tensor(.5))
+            def forward(self, x, physics, return_decoder_features=False):
+                logits = x[:, :1] * self.scale
+                return dict(logits_det=logits, decoder_feature=logits.expand(-1, 64, -1, -1).contiguous())
+        device = torch.device('cuda:0')
+        backbone = Backbone().to(device).requires_grad_(False).eval()
+        parent = DecoderFeatureRefiner().to(device).requires_grad_(False).eval()
+        frozen_sha = (model_state_digest(backbone), model_state_digest(parent))
+        heads, optimizers = runner.initialize_pair(4, device)
+        runner.verify_zero_pair(backbone, parent, heads, cpu_batch, device)
+        initial_records = runner.validation_records(backbone, parent, heads, loader, device,
+            include_parent=True, require_parent_equal=True)
+        self.assertEqual(set(initial_records), {'parent', *runner.ARMS})
+        batch = runner.history_to_device(cpu_batch, device)
+        self.assertEqual(batch['history_delta'].device.type, 'cuda')
+        self.assertEqual(batch['history_valid'].device.type, 'cuda')
+        with torch.no_grad():
+            outputs = backbone(batch['x_norm'], batch['physics'], return_decoder_features=True)
+            anchor = parent(outputs, batch['physics'])
+        for arm in runner.ARMS:
+            optimizers[arm].zero_grad(set_to_none=True)
+            logits = runner.corrected_logits(heads[arm], arm, outputs, anchor, batch)
+            self.assertTrue(torch.equal(logits, anchor))
+            loss = masked_refinement_loss(logits, batch['target'], batch['valid_mask'], aux_weight=0.)['bce']
+            self.assertTrue(torch.isfinite(loss))
+            loss.backward()
+            gradients = [parameter.grad for parameter in heads[arm].parameters()]
+            self.assertTrue(all(gradient is not None and bool(torch.isfinite(gradient).all()) for gradient in gradients))
+            self.assertGreater(float(heads[arm].output.weight.grad.abs().sum()), 0.)
+            optimizers[arm].step()
+            with torch.no_grad():
+                after = runner.corrected_logits(heads[arm], arm, outputs, anchor, batch)
+            self.assertTrue(torch.equal(after[~batch['history_valid']], anchor[~batch['history_valid']]))
+            self.assertTrue(torch.equal(after[0], anchor[0]))
+            self.assertTrue(bool((after[1] != anchor[1]).any()))
+        rows = runner.validation_records(backbone, parent, heads, loader, device)
+        for arm in runner.ARMS:
+            self.assertEqual([row['sample_id'] for row in rows[arm]], ['sample-0', 'sample-1'])
+            np.testing.assert_array_equal(rows[arm][0]['calibration_logit'], initial_records['parent'][0]['calibration_logit'])
+            self.assertTrue(all(np.isfinite(row['calibration_logit']).all() for row in rows[arm]))
+        self.assertEqual((model_state_digest(backbone), model_state_digest(parent)), frozen_sha)
+        self.assertTrue(all(parameter.grad is None for model in (backbone, parent) for parameter in model.parameters()))
+
     def test_parent_source_additions_are_explicit_and_cannot_change_frozen_files(self):
         validate = runner.previous.validate_parent_source_files
         original = {'fwt_v2/model.py': 'model-sha', 'tools/frozen.py': 'runner-sha'}
