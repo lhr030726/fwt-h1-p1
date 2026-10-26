@@ -18,6 +18,7 @@ from .manifest import load_manifest, manifest_digest
 from .models import FWTConfig, FWTDet, RCDABaseline, validate_wind_prior_config
 from .protocol import probability_metrics, select_raw_threshold
 from .gradient_diagnostics import gradient_l2_norm, gradients_finite
+from .validation_sampling import validation_parallel_samples
 
 
 def audited_manifest(path):
@@ -163,22 +164,32 @@ def load_predictor(checkpoint, backbone_checkpoint=None, device='cpu'):
     return backbone, head.to(device).eval(), bundle
 
 
-def raw_probability(backbone, head, batch, sampling, generator=None, return_logits=False):
+def raw_probability(backbone, head, batch, sampling, generator=None, return_logits=False,
+                    *, parallel_samples=1):
     outputs = backbone(batch['x_norm'], batch['physics'])
     if head is None:
         probability = outputs['logits_det'].sigmoid()
         return (probability, outputs['logits_det']) if return_logits else probability
     if isinstance(head, ConditionalResidualDiffusion):
+        if type(parallel_samples) is not int or parallel_samples < 1:
+            raise ValueError('parallel_samples must be a positive integer')
+        # DDPM draws new noise at every step: retain the original serial stream.
+        width = parallel_samples if sampling['method'] == 'ddim' else 1
         probabilities = []
-        for index, sample_id in enumerate(batch['sample_id']):
-            seed = int.from_bytes(hashlib.sha256(f"{sampling['seed']}:{sample_id}".encode()).digest()[:8], 'big') % (2**63 - 1)
-            generator = torch.Generator(device='cpu').manual_seed(seed)
-            selected = dict(logits_det=outputs['logits_det'][index:index+1],
-                            fused_pyramid=[f[index:index+1] for f in outputs['fused_pyramid']],
-                            relational_feature=outputs['relational_feature'][index:index+1])
-            physics = {k: v[index:index+1] for k, v in batch['physics'].items()}
+        for index in range(0, len(batch['sample_id']), width):
+            sample_ids = batch['sample_id'][index:index+width]
+            generators = []
+            for sample_id in sample_ids:
+                seed = int.from_bytes(hashlib.sha256(f"{sampling['seed']}:{sample_id}".encode()).digest()[:8], 'big') % (2**63 - 1)
+                generators.append(torch.Generator(device='cpu').manual_seed(seed))
+            selected = dict(logits_det=outputs['logits_det'][index:index+width],
+                            fused_pyramid=[f[index:index+width] for f in outputs['fused_pyramid']],
+                            relational_feature=outputs['relational_feature'][index:index+width])
+            physics = {k: v[index:index+width] for k, v in batch['physics'].items()}
+            noise_args = (dict(generator=generators[0]) if len(generators) == 1
+                          else dict(sample_generators=generators))
             residual = head.sample(selected, physics, K=sampling['K'], steps=sampling['steps'],
-                                   method=sampling['method'], generator=generator)
+                                   method=sampling['method'], **noise_args)
             probabilities.append(compute_probability(selected, residual))
         probability = torch.cat(probabilities)
     else:
@@ -199,7 +210,7 @@ def records_from_batch(batch, probability, calibration_logits=None):
 
 
 @torch.no_grad()
-def validation_records(backbone, head, loader, device, sampling):
+def validation_records(backbone, head, loader, device, sampling, *, parallel_samples=1):
     backbone.eval()
     if head is not None:
         head.eval()
@@ -207,7 +218,8 @@ def validation_records(backbone, head, loader, device, sampling):
     generator = torch.Generator(device='cpu').manual_seed(sampling['seed'])
     for batch in loader:
         batch = to_device(batch, device)
-        probability, logits = raw_probability(backbone, head, batch, sampling, generator, return_logits=True)
+        probability, logits = raw_probability(backbone, head, batch, sampling, generator,
+                                               return_logits=True, parallel_samples=parallel_samples)
         records.extend(records_from_batch(batch, probability, logits))
     return records
 
@@ -291,6 +303,7 @@ def train(args, config, family):
     digest = manifest_digest(manifest)
     normalizer = NormalizationStats.load(args.normalizer)
     seed_everything(args.seed)
+    p1_parallel_samples = validation_parallel_samples()
     sampling = dict(K=args.samples, steps=args.sampling_steps, method=args.sampler, seed=args.seed,
                     seed_strategy='sha256_base_seed_sample_id_v1')
     head, backbone_bundle, warm_start = None, None, None
@@ -382,7 +395,8 @@ def train(args, config, family):
     provenance['device'] = str(args.device)
     provenance['cpu_threads'] = torch.get_num_threads()
     provenance['performance'] = dict(sample_cache_gib=cache_gib, num_workers=0,
-                                     validation_batch_size=validation_batch_size)
+                                     validation_batch_size=validation_batch_size,
+                                     p1_validation_parallel_samples=p1_parallel_samples)
     provenance['manifest_file_sha256'] = sha256(args.manifest)
     # Explicit defaults bind AdamW's actual recipe, not merely its class name.
     provenance['optimizer_defaults'] = deepcopy(optimizer.defaults)
@@ -465,7 +479,8 @@ def train(args, config, family):
             optimizer.step()
             losses.append(float(loss.detach()))
             updates += 1
-        records = validation_records(backbone, head, val_loader, args.device, sampling)
+        records = validation_records(backbone, head, val_loader, args.device, sampling,
+                                     parallel_samples=p1_parallel_samples)
         prediction_checks = prediction_diagnostics(records)
         metrics = probability_metrics(records)
         ap = metrics['pooled_ap']

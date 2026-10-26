@@ -334,7 +334,8 @@ class ConditionalResidualDiffusion(nn.Module):
         return self.training_loss(target, outputs, physics, **kwargs)
 
     @torch.no_grad()
-    def sample(self, outputs, physics, K=4, steps=20, method="ddim", generator=None):
+    def sample(self, outputs, physics, K=4, steps=20, method="ddim", generator=None,
+               *, sample_generators=None):
         if not isinstance(K, int) or K < 1:
             raise ValueError("K must be a positive integer")
         if not isinstance(steps, int) or not 1 <= steps <= self.config.timesteps:
@@ -350,7 +351,18 @@ class ConditionalResidualDiffusion(nn.Module):
                     None if relational is None else relational.repeat_interleave(K, 0))
         logits_det = (outputs["logits_det"].detach().repeat_interleave(K, 0)
                       if self.config.prediction_type == "clean_probability" else None)
-        rt = _normal((batch*K, 1, height, width), p_det, generator)
+        if sample_generators is None:
+            rt = _normal((batch*K, 1, height, width), p_det, generator)
+        else:
+            if (method != "ddim" or generator is not None
+                    or len(sample_generators) != batch
+                    or any(not isinstance(g, torch.Generator) or g.device.type != "cpu"
+                           for g in sample_generators)):
+                raise ValueError("sample_generators requires DDIM and one CPU generator per sample")
+            # Keep each original K-shaped CPU draw exactly, then transfer once.
+            rt = torch.cat([torch.randn((K, 1, height, width), dtype=p_det.dtype,
+                                        device="cpu", generator=g)
+                            for g in sample_generators], dim=0).to(p_det.device)
         indices = torch.linspace(self.config.timesteps-1, 0, steps).round().long().tolist()
         for position, step in enumerate(indices):
             timesteps = torch.full((batch*K,), step, dtype=torch.long, device=rt.device)
