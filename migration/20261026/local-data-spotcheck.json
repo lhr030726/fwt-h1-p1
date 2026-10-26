@@ -1,0 +1,44 @@
+[
+  {
+    "remote": "/root/autodl-tmp/fwt-h1-p1/data/arrays/train/inputs/UID_FIRE_1064_2015-05-21.npy",
+    "local": "D:\\火灾数据\\Wildfire_Spread_Prediction_Model\\解压后\\dataset\\train\\inputs\\UID_FIRE_1064_2015-05-21.npy",
+    "exists": true,
+    "size": 3145856,
+    "sha256_match": true
+  },
+  {
+    "remote": "/root/autodl-tmp/fwt-h1-p1/data/arrays/train/labels/UID_FIRE_1064_2015-05-21.npy",
+    "local": "D:\\火灾数据\\Wildfire_Spread_Prediction_Model\\解压后\\dataset\\train\\labels\\UID_FIRE_1064_2015-05-21.npy",
+    "exists": true,
+    "size": 65664,
+    "sha256_match": true
+  },
+  {
+    "remote": "/root/autodl-tmp/fwt-h1-p1/data/arrays/train/labels/UID_FIRE_134_2019-07-14.npy",
+    "local": "D:\\火灾数据\\Wildfire_Spread_Prediction_Model\\解压后\\dataset\\train\\labels\\UID_FIRE_134_2019-07-14.npy",
+    "exists": true,
+    "size": 65664,
+    "sha256_match": true
+  },
+  {
+    "remote": "/root/autodl-tmp/fwt-h1-p1/data/arrays/train/inputs/UID_FIRE_136_2019-07-11.npy",
+    "local": "D:\\火灾数据\\Wildfire_Spread_Prediction_Model\\解压后\\dataset\\train\\inputs\\UID_FIRE_136_2019-07-11.npy",
+    "exists": true,
+    "size": 3145856,
+    "sha256_match": true
+  },
+  {
+    "remote": "/root/autodl-tmp/fwt-h1-p1/data/arrays/train/inputs/UID_FIRE_467_2019-07-22.npy",
+    "local": "D:\\火灾数据\\Wildfire_Spread_Prediction_Model\\解压后\\dataset\\train\\inputs\\UID_FIRE_467_2019-07-22.npy",
+    "exists": true,
+    "size": 3145856,
+    "sha256_match": true
+  },
+  {
+    "remote": "/root/autodl-tmp/fwt-h1-p1/data/arrays/train/labels/UID_FIRE_467_2019-07-22.npy",
+    "local": "D:\\火灾数据\\Wildfire_Spread_Prediction_Model\\解压后\\dataset\\train\\labels\\UID_FIRE_467_2019-07-22.npy",
+    "exists": true,
+    "size": 65664,
+    "sha256_match": true
+  }
+]

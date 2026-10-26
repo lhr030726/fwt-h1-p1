@@ -1,0 +1,11 @@
+{
+  "status": "verified",
+  "files": 2758,
+  "bytes": 4428686080,
+  "roles": "residual_train_validation",
+  "dataset": "D:\\火灾数据\\Wildfire_Spread_Prediction_Model\\解压后\\dataset",
+  "data_root": null,
+  "arrays_index_sha256": "d3bd70026a2435563f644cf949a8e1689cb234b021a6ebd25602d76ad6ba3eff",
+  "all_sha256_equal": true,
+  "restoration_performed": false
+}
