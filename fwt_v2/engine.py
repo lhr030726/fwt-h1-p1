@@ -17,6 +17,7 @@ from .diffusion import (ConditionalResidualDiffusion, DiffusionConfig, compute_p
 from .manifest import load_manifest, manifest_digest
 from .models import FWTConfig, FWTDet, RCDABaseline, validate_wind_prior_config
 from .protocol import probability_metrics, select_raw_threshold
+from .gradient_diagnostics import gradient_l2_norm, gradients_finite
 
 
 def audited_manifest(path):
@@ -63,13 +64,6 @@ def batch_diagnostics(batch):
                 target_finite=bool(torch.isfinite(batch['target']).all()),
                 domain_pixels=int(batch['domain_mask'].sum()), valid_pixels=int(valid.sum()),
                 new_pixels=int(((batch['target'] > .5) & valid).sum()))
-
-
-def gradient_l2_norm(gradients):
-    # Float64 reduction prevents squared finite FP32 values overflowing. No clipping,
-    # parameter update, random draw or extra forward/backward pass occurs here.
-    return math.hypot(*(float(torch.linalg.vector_norm(g.detach(), dtype=torch.float64))
-                        for g in gradients))
 
 
 def prediction_diagnostics(records):
@@ -465,7 +459,7 @@ def train(args, config, family):
                 raise RuntimeError('Nonfinite loss; stop and retain diagnostics')
             loss.backward()
             gradients = [p.grad for p in model.parameters() if p.grad is not None]
-            if not gradients or not all(torch.isfinite(g).all() for g in gradients):
+            if not gradients or not gradients_finite(gradients):
                 raise RuntimeError('Missing or nonfinite gradients')
             gradient_norms.append(gradient_l2_norm(gradients))
             optimizer.step()
