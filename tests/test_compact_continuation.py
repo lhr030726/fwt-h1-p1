@@ -182,6 +182,21 @@ class ContinuationTests(unittest.TestCase):
             parent, heads, optimizers, bindings, _, transaction = fork_fixture()
             parent_integrity = optimizer_state_integrity(parent['optimizer_state_dict'])
             parent_tensors = deepcopy(parent['optimizer_state_dict']['state'])
+            # First exercise the parent-copy boundary before any transaction
+            # restore can replace these directly inherited optimizer states.
+            other_before_parent_update = optimizer_state_integrity(optimizers['lower_lr'].state_dict())
+            for arm in runner.ARMS:
+                for identity, tensors in optimizers[arm].state_dict()['state'].items():
+                    for key, tensor in tensors.items():
+                        self.assertNotEqual(tensor.data_ptr(), parent['optimizer_state_dict']['state'][identity][key].data_ptr())
+            for left, right in zip(optimizers['constant_lr'].state.values(), optimizers['lower_lr'].state.values()):
+                for key in left:
+                    self.assertNotEqual(left[key].data_ptr(), right[key].data_ptr())
+            step(heads['constant_lr'], optimizers['constant_lr'])
+            self.assertTrue(all(v['step'].item() == 2500 for v in optimizers['constant_lr'].state.values()))
+            self.assertTrue(all(v['step'].item() == 2499 for v in optimizers['lower_lr'].state.values()))
+            self.assertEqual(optimizer_state_integrity(parent['optimizer_state_dict']), parent_integrity)
+            self.assertEqual(optimizer_state_integrity(optimizers['lower_lr'].state_dict()), other_before_parent_update)
             decoded = runner.restore_transaction(transaction, heads, optimizers, bindings, 'cpu')
             snapshot = runner.make_state(heads['constant_lr'], optimizers['constant_lr'],
                 bindings['constant_lr'], [], decoded['constant_lr']['last']['baseline_validation'], 'cpu')
