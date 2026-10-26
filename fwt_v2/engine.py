@@ -17,7 +17,7 @@ from .diffusion import (ConditionalResidualDiffusion, DiffusionConfig, compute_p
 from .manifest import load_manifest, manifest_digest
 from .models import FWTConfig, FWTDet, RCDABaseline, validate_wind_prior_config
 from .protocol import probability_metrics, select_raw_threshold
-from .gradient_diagnostics import gradient_l2_norm, gradients_finite
+from .gradient_diagnostics import gradient_l2_norm, gradients_finite, legacy_gradient_l2_norm
 from .validation_sampling import validation_parallel_samples
 
 
@@ -432,7 +432,9 @@ def train(args, config, family):
                        cpu_threads=provenance['cpu_threads'], source_sha256=provenance['source_sha256'],
                        total_updates=0, completed_epochs=0, remaining_epochs=args.epochs,
                        first_batch=None, epochs=[], frozen_backbone=None,
-                       wall_seconds_scope='current_process_segment')
+                       wall_seconds_scope='current_process_segment',
+                       gradient_diagnostic_strategy=('batched_cuda_scalar_transfers' if head is None
+                                                     else 'legacy_per_tensor_scalar_transfers'))
     if warm_start is not None:
         diagnostics['warm_start'] = warm_start
     if family == 'diff':
@@ -453,7 +455,9 @@ def train(args, config, family):
         history, best, updates = restart['history'], restart['best_validation_ap'], restart['updates']
         selected, selected_validation = restart['selected'], restart['selected_validation']
         diagnostics = restart['diagnostics']
-        diagnostics.update(status='running', resume=provenance['resume'])
+        diagnostics.update(status='running', resume=provenance['resume'],
+                           gradient_diagnostic_strategy=('batched_cuda_scalar_transfers' if head is None
+                                                         else 'legacy_per_tensor_scalar_transfers'))
         # Best may remain in a previous segment; make this new directory a
         # self-contained run while keeping selection unfrozen until completion.
         atomic_checkpoint(destination / 'best.pth', selected)
@@ -488,9 +492,14 @@ def train(args, config, family):
                 raise RuntimeError('Nonfinite loss; stop and retain diagnostics')
             loss.backward()
             gradients = [p.grad for p in model.parameters() if p.grad is not None]
-            if not gradients or not gradients_finite(gradients):
-                raise RuntimeError('Missing or nonfinite gradients')
-            gradient_norms.append(gradient_l2_norm(gradients))
+            if head is None:
+                if not gradients or not gradients_finite(gradients):
+                    raise RuntimeError('Missing or nonfinite gradients')
+                gradient_norms.append(gradient_l2_norm(gradients))
+            else:
+                if not gradients or not all(torch.isfinite(g).all() for g in gradients):
+                    raise RuntimeError('Missing or nonfinite gradients')
+                gradient_norms.append(legacy_gradient_l2_norm(gradients))
             optimizer.step()
             losses.append(float(loss.detach()))
             updates += 1

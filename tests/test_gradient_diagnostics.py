@@ -78,7 +78,12 @@ class GradientDiagnosticsTests(unittest.TestCase):
         body = owners[0].body
         start = body.index(loop)
         boundary = compile(ast.fix_missing_locations(ast.Module(
-            body=body[start:start + 4], type_ignores=[])), '<engine gradient boundary>', 'exec')
+            body=body[start:next(i + 1 for i, node in enumerate(body[start:], start)
+                if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and isinstance(node.value.func.value, ast.Name)
+                and node.value.func.value.id == 'optimizer' and node.value.func.attr == 'step')],
+            type_ignores=[])), '<engine gradient boundary>', 'exec')
         for value in [None, float('nan'), float('inf'), -float('inf')]:
             model = torch.nn.Linear(2, 1)
             optimizer = torch.optim.AdamW(model.parameters(), lr=.001)
@@ -88,7 +93,7 @@ class GradientDiagnosticsTests(unittest.TestCase):
             before_optimizer = deepcopy(optimizer.state_dict())
             with patch('fwt_v2.gradient_diagnostics.gradient_l2_norm',
                        side_effect=AssertionError('norm must not run')) as norm:
-                environment = dict(model=model, optimizer=optimizer, gradient_norms=[],
+                environment = dict(model=model, head=None, optimizer=optimizer, gradient_norms=[],
                                    gradients_finite=gradients_finite, gradient_l2_norm=norm)
                 with self.assertRaisesRegex(RuntimeError, 'Missing or nonfinite gradients'):
                     exec(boundary, environment)

@@ -31,3 +31,9 @@ def gradient_l2_norm(gradients):
     # Per-tensor float64 reductions and original Python merge order are unchanged.
     return math.hypot(*(float(torch.linalg.vector_norm(g.detach(), dtype=torch.float64))
                         for g in gradients))
+
+
+def legacy_gradient_l2_norm(gradients):
+    # Preserve the original P1 per-tensor transfer/reduction after measured regression.
+    return math.hypot(*(float(torch.linalg.vector_norm(g.detach(), dtype=torch.float64))
+                        for g in gradients))
