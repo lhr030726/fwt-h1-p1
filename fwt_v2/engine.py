@@ -218,6 +218,58 @@ def validation_records(backbone, head, loader, device, sampling):
     return records
 
 
+def load_warm_start_h1(model, lineage, model_config, data_config, manifest, normalizer_hash):
+    """Load selected original H1 weights only; preserve seed RNG and reset optimizer.
+
+    This is an additional optimization segment, not an exact optimizer/RNG resume.
+    No original source code is executed and no checkpoint metadata is rewritten.
+    """
+    from .backbone_compat import verify_backbone_sources
+    compatibility = verify_backbone_sources(
+        lineage['source_compatibility']['original_source_tree'], strict_training_only=True)
+    if compatibility != lineage['source_compatibility']:
+        raise ValueError('Warm-start source compatibility changed after preflight')
+    path = lineage['checkpoint']
+    if sha256(path) != lineage['checkpoint_sha256']:
+        raise ValueError('Warm-start original checkpoint bytes changed')
+    bundle = load_checkpoint(path)
+    expected = dict(family='det', architecture='fwt', selection_frozen=True,
+        source_sha256=compatibility['original_source_sha256'],
+        model_config=asdict(model_config), data_config=asdict(data_config),
+        manifest_sha256=manifest_digest(manifest), normalizer_sha256=normalizer_hash,
+        requested_epochs=lineage['original_completed_epochs'],
+        completed_epochs=lineage['original_completed_epochs'],
+        epoch=lineage['selected_epoch'], validation_ap=lineage['validation_ap'])
+    for key, value in expected.items():
+        if bundle.get(key) != value:
+            raise ValueError('Warm-start checkpoint metadata mismatch: ' + key)
+    for key, role in (('training_sample_ids', 'backbone_train'), ('validation_sample_ids', 'validation')):
+        if bundle.get(key) != [row['sample_id'] for row in manifest['samples'] if row['role'] == role]:
+            raise ValueError('Warm-start checkpoint sample identities mismatch: ' + key)
+    state = bundle.get('state_dict', {})
+    expected_state = model.state_dict()
+    if set(state) != set(expected_state):
+        raise ValueError('Warm-start model state keys differ')
+    for name, tensor in state.items():
+        if (not isinstance(tensor, torch.Tensor) or tensor.shape != expected_state[name].shape
+                or tensor.dtype != expected_state[name].dtype or not torch.isfinite(tensor).all()):
+            raise ValueError('Invalid warm-start tensor: ' + name)
+    model.load_state_dict(state, strict=True)
+    if any(not torch.equal(tensor.cpu(), model.state_dict()[name].detach().cpu())
+           for name, tensor in state.items()):
+        raise RuntimeError('Warm-start loading changed checkpoint tensor values')
+    return dict(schema='fwt_h1_weight_warm_start_v1', checkpoint=str(path),
+        checkpoint_sha256=lineage['checkpoint_sha256'],
+        original_source_sha256=compatibility['original_source_sha256'],
+        current_source_sha256=compatibility['current_source_sha256'],
+        original_completed_epochs=lineage['original_completed_epochs'],
+        original_selected_epoch=lineage['selected_epoch'], original_validation_ap=lineage['validation_ap'],
+        initial_state_sha256=model_state_digest(model), tensor_values_unchanged=True,
+        optimizer_state_reused=False, rng_state_reused=False,
+        source_compatibility=compatibility,
+        epoch_scope='Additional segment from selected weights; epoch counters restart at zero')
+
+
 def train(args, config, family):
     from copy import deepcopy
     from .reporting import operating_point_report
@@ -231,6 +283,9 @@ def train(args, config, family):
     if stop_after is not None and (type(stop_after) is not int or not 1 <= stop_after < args.epochs):
         raise ValueError('stop-after-epoch must be positive and below the unchanged total epoch budget')
     resume_path = getattr(args, 'resume', None)
+    warm_lineage = getattr(args, 'warm_start_h1', None)
+    if warm_lineage is not None and (family != 'det' or resume_path is not None):
+        raise ValueError('Selected H1 weight warm-start requires det without optimizer resume')
     data_config = DataConfig(**config['data'])
     if family in ('det', 'det_budget_control'):
         model_config = FWTConfig(**config.get('model', {}))
@@ -244,12 +299,15 @@ def train(args, config, family):
     seed_everything(args.seed)
     sampling = dict(K=args.samples, steps=args.sampling_steps, method=args.sampler, seed=args.seed,
                     seed_strategy='sha256_base_seed_sample_id_v1')
-    head, backbone_bundle = None, None
+    head, backbone_bundle, warm_start = None, None, None
     architecture = getattr(args, 'architecture', 'fwt')
     if family in ('det', 'det_budget_control'):
         backbone = build_det(model_config, architecture, data_config).to(args.device)
         model = backbone
         role = 'backbone_train'
+        if warm_lineage is not None:
+            warm_start = load_warm_start_h1(backbone, warm_lineage, model_config,
+                data_config, manifest, sha256(args.normalizer))
     else:
         backbone, backbone_bundle = load_det(args.backbone, args.device)
         if backbone_bundle['family'] != 'det' or backbone_bundle.get('architecture', 'fwt') != 'fwt':
@@ -296,6 +354,10 @@ def train(args, config, family):
     val_loader = make_loader(manifest, 'validation', normalizer, data_config, validation_batch_size,
                              sample_cache=sample_cache)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    if warm_start is not None:
+        if optimizer.state:
+            raise RuntimeError('Warm-start must begin with a fresh optimizer')
+        warm_start['optimizer_initial_state_empty'] = True
     provenance = dict(schema='fwt_checkpoint_v2', family=family, architecture=architecture,
                       model_config=asdict(model_config), data_config=asdict(data_config),
                       manifest_sha256=digest, normalizer_sha256=sha256(args.normalizer),
@@ -311,6 +373,8 @@ def train(args, config, family):
                       batch_size=args.batch_size, requested_epochs=args.epochs,
                       initialization='new_random_initialization', selection_frozen=False)
     provenance['source_sha256'] = source_digest()
+    if warm_start is not None:
+        provenance.update(initialization='warm_start_selected_h1_new_optimizer', warm_start=warm_start)
     if head is not None:
         provenance.update(diffusion_config=asdict(diffusion_config), backbone_sha256=sha256(args.backbone))
         if family == 'diff':
@@ -346,6 +410,8 @@ def train(args, config, family):
                        total_updates=0, completed_epochs=0, remaining_epochs=args.epochs,
                        first_batch=None, epochs=[], frozen_backbone=None,
                        wall_seconds_scope='current_process_segment')
+    if warm_start is not None:
+        diagnostics['warm_start'] = warm_start
     if family == 'diff':
         diagnostics['prediction_type'] = diffusion_config.prediction_type
         diagnostics['training_timestep_sampling'] = diffusion_config.training_timestep_sampling
@@ -454,7 +520,8 @@ def train(args, config, family):
                 provenance['normalizer_sha256'] != sha256(args.normalizer) or
                 provenance['manifest_file_sha256'] != sha256(args.manifest) or
                 binding['input_files'] != sample_file_identity(samples) or
-                (head is not None and provenance['backbone_sha256'] != sha256(args.backbone))):
+                (head is not None and provenance['backbone_sha256'] != sha256(args.backbone)) or
+                (warm_start is not None and warm_start['checkpoint_sha256'] != sha256(warm_start['checkpoint']))):
             raise RuntimeError('Training inputs/source changed; cannot save a resumable epoch or freeze selection')
         if head is not None:
             frozen = diagnostics['frozen_backbone']

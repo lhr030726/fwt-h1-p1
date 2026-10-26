@@ -10,11 +10,7 @@ from datetime import datetime
 import hashlib
 from pathlib import Path
 
-import torch
-
-from .artifacts import atomic_checkpoint, atomic_json, load_checkpoint, output_path, sha256
-from .data import DataConfig, NormalizationStats, RCDADataset
-from .manifest import manifest_digest
+from .portable import file_sha256 as sha256
 
 
 # Complete local dependency closure for deterministic architecture, input
@@ -23,7 +19,7 @@ from .manifest import manifest_digest
 # never use this command. The engine's deterministic call path is checked below.
 BACKBONE_MODULES = ('__init__.py', 'models.py', 'normalization.py', 'fusion.py', 'propagation.py',
                     'rcda.py', 'data.py', 'geography.py', 'hourly.py', 'manifest.py',
-                    'artifacts.py', 'protocol.py')
+                    'artifacts.py', 'protocol.py', 'portable.py', 'sample_cache.py')
 ENGINE_FUNCTIONS = ('audited_manifest', 'seed_everything', 'source_digest',
                     'model_state_digest', 'build_det', 'to_device',
                     'deterministic_loss', 'make_loader', 'load_det',
@@ -44,7 +40,7 @@ def _ast_digest(node):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def _engine_contract(path):
+def _engine_contract(path, strict_training_only=False):
     tree = ast.parse(Path(path).read_text(encoding='utf-8-sig'))
     functions = {}
     for node in tree.body:
@@ -59,6 +55,10 @@ def _engine_contract(path):
                                 if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))],
                            type_ignores=[])
     result = {'module_setup': _ast_digest(top_level)}
+    if strict_training_only:
+        for name, node in sorted(functions.items()):
+            if name not in ('train', 'load_warm_start_h1'):
+                result['strict_function:' + name] = _ast_digest(node)
     # Follow any engine-local helper referenced by a protected function. This
     # prevents an unchanged wrapper from concealing a changed implementation.
     pending = list(ENGINE_FUNCTIONS)
@@ -90,19 +90,27 @@ def _engine_contract(path):
     return result
 
 
-def verify_backbone_sources(source_tree):
+def verify_backbone_sources(source_tree, strict_training_only=False):
     old_package = Path(source_tree).resolve() / 'fwt_v2'
     current_package = Path(__file__).resolve().parent
     if old_package == current_package:
         raise ValueError('Provide the preserved original source tree, not the current implementation')
     old_digest, new_digest = package_source_digest(old_package), package_source_digest(current_package)
     modules = {}
-    for name in BACKBONE_MODULES:
+    protected = BACKBONE_MODULES
+    if strict_training_only:
+        old_names = {path.name for path in old_package.glob('*.py')}
+        new_names = {path.name for path in current_package.glob('*.py')}
+        if old_names != new_names:
+            raise ValueError('Strict warm-start requires the identical package module set')
+        protected = sorted(new_names - {'engine.py', 'backbone_compat.py'})
+    for name in protected:
         old_path, new_path = old_package / name, current_package / name
         if not old_path.is_file() or not new_path.is_file() or sha256(old_path) != sha256(new_path):
             raise ValueError('Backbone source changed: ' + name)
         modules[name] = sha256(new_path)
-    old_engine, new_engine = _engine_contract(old_package / 'engine.py'), _engine_contract(current_package / 'engine.py')
+    old_engine = _engine_contract(old_package / 'engine.py', strict_training_only)
+    new_engine = _engine_contract(current_package / 'engine.py', strict_training_only)
     if old_engine != new_engine:
         changed = sorted(name for name in set(old_engine) | set(new_engine)
                          if old_engine.get(name) != new_engine.get(name))
@@ -111,11 +119,14 @@ def verify_backbone_sources(source_tree):
                 current_source_tree=str(current_package.parent),
                 original_source_sha256=old_digest, current_source_sha256=new_digest,
                 unchanged_module_sha256=modules, unchanged_engine_ast_sha256=new_engine,
-                allowed_source_changes='Diffusion implementation, CLI and non-inference training/diagnostic paths only',
+                strict_training_only=strict_training_only,
+                allowed_source_changes=('Training/diagnostic paths and compatibility validator only'
+                    if strict_training_only else 'Diffusion implementation, CLI and non-inference training/diagnostic paths only'),
                 scope='Frozen deterministic inference equivalence; no diffusion compatibility or new training result')
 
 
 def _state_equal(left, right):
+    import torch
     return (left.keys() == right.keys()
             and all(isinstance(left[name], torch.Tensor) and isinstance(right[name], torch.Tensor)
                     and left[name].dtype == right[name].dtype
@@ -130,6 +141,10 @@ def rebind_backbone(args):
     RCDADataset verifies normalization/georeferences but never reads its arrays.
     No checkpoint selection, model optimization or held-out evaluation occurs.
     """
+    import torch
+    from .artifacts import atomic_checkpoint, atomic_json, load_checkpoint, output_path
+    from .data import DataConfig, NormalizationStats, RCDADataset
+    from .manifest import manifest_digest
     from .engine import audited_manifest, build_det, model_state_digest, source_digest
     from .models import FWTConfig, validate_wind_prior_config
 

@@ -1,7 +1,8 @@
 """Portable H1/P1 training. Default is a read-only metadata preflight.
 
-Run --phase det --execute, then --phase diff --execute explicitly. There is
-no held-out evaluation command, automatic second stage, or resume shortcut.
+Run --phase det --execute, then --phase diff --execute explicitly. An explicit
+--warm-start-h1-run starts an additional H1 segment from a selected checkpoint.
+There is no held-out evaluation command, automatic second stage or P1 resume.
 """
 from __future__ import annotations
 
@@ -54,11 +55,21 @@ def parser():
                         help='Explicit training recipe variant; use the same value for H1 and P1')
     result.add_argument('--p1-zero-init', action='store_true',
                         help='Zero P1 final correction layer after normal construction; set for BOTH H1 and P1')
+    result.add_argument('--p1-learning-rate', type=float, default=.001,
+                        help='P1 AdamW learning rate; bind the same recipe flags in both stages')
+    result.add_argument('--h1-learning-rate', type=float, default=.001,
+                        help='H1 AdamW learning rate; bind the same recipe flags in both stages')
+    result.add_argument('--warm-start-h1-run', type=Path,
+                        help='Completed original H1 run for an additional segment with a fresh optimizer; set BOTH stages')
+    result.add_argument('--warm-start-h1-source-tree', type=Path,
+                        help='Preserved original source tree for strict compatibility verification')
+    result.add_argument('--h1-epochs', type=int, choices=(2, 30, 60), default=None)
+    result.add_argument('--p1-epochs', type=int, choices=(2, 30, 60), default=None)
     result.add_argument('--validation-batch-size', type=int, default=None,
                         help='Validation batching; defaults to training batch size')
     result.add_argument('--sample-cache-gib', type=float, default=0.,
                         help='Shared CPU tensor-cache budget for training and validation, 0..64 GiB')
-    result.add_argument('--epochs', type=int, choices=(2, 30), default=30)
+    result.add_argument('--epochs', type=int, choices=(2, 30, 60), default=30)
     result.add_argument('--execute', action='store_true', help='Explicitly start this one training stage')
     return result
 
@@ -173,21 +184,120 @@ def _check_own_det(directory, binding):
     if not (directory / 'portable_completed.json').is_file():
         raise ValueError('Diff preflight waits for the completed Det in the SAME run-dir/profile')
     receipt = read_json(directory / 'portable_completed.json')
+    expected = dict(binding, epochs=binding.get('stage_epochs', {}).get('det', binding['epochs']))
     if (receipt.get('schema_version') != 'fwt_portable_training_completed_v1'
             or receipt.get('status') != 'completed' or receipt.get('phase') != 'det'
-            or receipt.get('binding') != binding):
+            or receipt.get('binding') != expected):
         raise ValueError('Diff requires its own completed Det with identical data/source/budget')
     files = receipt.get('files', {})
-    for name in ('best.pth', 'selection.json', 'diagnostics.json', 'history.json', 'configuration.json'):
+    for name in ('best.pth', 'last.pth', 'selection.json', 'diagnostics.json', 'history.json',
+                 'configuration.json', 'validation_selected.json'):
         if files.get(name) != file_sha256(directory / name):
             raise ValueError('Own Det completion artifact changed: ' + name)
     diagnostic = read_json(directory / 'diagnostics.json')
     selection = read_json(directory / 'selection.json')
     if (diagnostic.get('status') != 'completed'
-            or diagnostic.get('completed_epochs') != binding['epochs']
+            or diagnostic.get('completed_epochs') != expected['epochs']
             or selection.get('selection_frozen') is not True):
         raise ValueError('Own Det selection is not fully completed and frozen')
     return directory / 'best.pth'
+
+
+def _check_warm_start_det(run_root, source_tree, binding, manifest, config):
+    """Read-only exact original selection and protected source compatibility."""
+    from fwt_v2.backbone_compat import verify_backbone_sources
+    compatibility = verify_backbone_sources(source_tree, strict_training_only=True)
+    directory = run_root / binding['profile'] / 'det'
+    receipt_path = directory / 'portable_completed.json'
+    receipt = read_json(receipt_path)
+    original = receipt.get('binding', {})
+    if (receipt.get('schema_version') != 'fwt_portable_training_completed_v1'
+            or receipt.get('status') != 'completed' or receipt.get('phase') != 'det'
+            or receipt.get('heldout_evaluation') is not False
+            or receipt.get('smoke_only') is not (binding['profile'] == 'smoke-2ep')):
+        raise ValueError('Reused H1 requires a completed development-only Det receipt')
+    if (compatibility['original_source_sha256'] != original.get('source_sha256')
+            or compatibility['current_source_sha256'] != binding['source_sha256']
+            or file_sha256(source_tree / 'train.py') != original.get('entry_sha256')):
+        raise ValueError('Original H1 source/entry differs from its completed provenance')
+    for key in ('bundle_sha256', 'files', 'profile', 'performance'):
+        if original.get(key) != binding[key]:
+            raise ValueError('Reused H1 data/source/budget mismatch: ' + key)
+    recipe = lambda value: {k: v for k, v in value.get('recipe', {}).items()
+                            if k not in ('p1_learning_rate', 'h1_learning_rate')}
+    if recipe(original) != recipe(binding):
+        raise ValueError('Original H1 recipe differs beyond the explicit H1/P1 learning rates')
+    if not re.fullmatch('[0-9a-f]{64}', original.get('entry_sha256', '')):
+        raise ValueError('Reused H1 must retain its original entry-point digest')
+    names = ('best.pth', 'last.pth', 'selection.json', 'diagnostics.json',
+             'history.json', 'configuration.json', 'validation_selected.json')
+    hashes = receipt.get('files', {})
+    if set(hashes) != set(names):
+        raise ValueError('Reused H1 receipt must bind all seven artifacts')
+    for name in names:
+        path = directory / name
+        if path.resolve().parent != directory.resolve() or hashes[name] != file_sha256(path):
+            raise ValueError('Reused H1 completion artifact changed: ' + name)
+    selection = read_json(directory / 'selection.json')
+    configuration = read_json(directory / 'configuration.json')
+    diagnostic = read_json(directory / 'diagnostics.json')
+    history = read_json(directory / 'history.json')
+    validation = read_json(directory / 'validation_selected.json')
+    epochs = original.get('epochs')
+    if type(epochs) is not int or epochs not in (2, 30, 60):
+        raise ValueError('Original H1 epoch budget is invalid')
+    updates = math.ceil(sum(row['role'] == 'backbone_train' for row in manifest['samples'])
+                        / binding['recipe']['batch_size']) * epochs
+    if (diagnostic.get('status') != 'completed' or diagnostic.get('family') != 'det'
+            or diagnostic.get('completed_epochs') != epochs or diagnostic.get('remaining_epochs') != 0
+            or diagnostic.get('total_updates') != updates
+            or selection.get('selection_frozen') is not True
+            or selection.get('completed_epochs') != epochs or selection.get('total_updates') != updates
+            or validation.get('selection_frozen') is not True
+            or validation.get('checkpoint_sha256') != hashes['best.pth']):
+        raise ValueError('Reused H1 must have a complete frozen selection and exact update budget')
+    expected_model = dict(MODEL, wind_scale=1., slope_scale=1.)
+    for document in (configuration, selection):
+        if (document.get('schema') != 'fwt_checkpoint_v2' or document.get('family') != 'det'
+                or document.get('architecture') != 'fwt' or document.get('requested_epochs') != epochs
+                or document.get('model_config') != expected_model
+                or _expanded_data(document.get('data_config', {})) != _expanded_data(config['data'])
+                or document.get('manifest_file_sha256') != binding['files']['manifest']
+                or document.get('batch_size') != binding['recipe']['batch_size']
+                or document.get('learning_rate') != RECIPE['learning_rate']
+                or document.get('seed') != binding['recipe']['seed']):
+            raise ValueError('Reused H1 model/data/training configuration mismatch')
+        for key, role in (('training_sample_ids', 'backbone_train'), ('validation_sample_ids', 'validation')):
+            if document.get(key) != [row['sample_id'] for row in manifest['samples'] if row['role'] == role]:
+                raise ValueError('Reused H1 sample identities mismatch: ' + key)
+    for document in (configuration, selection, diagnostic, validation):
+        if document.get('source_sha256') != original['source_sha256']:
+            raise ValueError('Reused H1 package source differs from the current implementation')
+    for document in (configuration, selection, validation):
+        if (document.get('normalizer_sha256') != binding['files']['normalizer']
+                or document.get('manifest_sha256') != configuration['manifest_sha256']):
+            raise ValueError('Reused H1 data/normalizer provenance mismatch')
+    if (not isinstance(history, list) or len(history) != epochs
+            or [row.get('epoch') for row in history] != list(range(epochs))):
+        raise ValueError('Reused H1 history must cover the exact epoch sequence')
+    aps = [row.get('validation', {}).get('pooled_ap') for row in history]
+    if any(type(ap) not in (int, float) or not math.isfinite(ap) or not 0 <= ap <= 1 for ap in aps):
+        raise ValueError('Reused H1 history must contain finite validation AP')
+    best_epoch = max(range(epochs), key=aps.__getitem__)
+    if (selection.get('epoch') != best_epoch or selection.get('validation_ap') != aps[best_epoch]
+            or selection.get('selection_metric') != 'pooled_validation_new_pixel_day_AP_max'
+            or selection.get('selection_tie_rule') != 'earliest_epoch'
+            or validation.get('epoch') != best_epoch
+            or validation.get('validation') != history[best_epoch]['validation']
+            or validation.get('validation_sample_ids') != selection['validation_sample_ids']):
+        raise ValueError('Reused H1 selected checkpoint must preserve maximum AP with earliest tie')
+    return dict(schema_version='fwt_warm_start_h1_v1', run_root=str(run_root), output=str(directory),
+        checkpoint=str(directory / 'best.pth'), checkpoint_sha256=hashes['best.pth'],
+        portable_completed_sha256=file_sha256(receipt_path), source_sha256=original['source_sha256'],
+        entry_sha256=original['entry_sha256'], selected_epoch=best_epoch,
+        selected_epoch_display=best_epoch + 1, validation_ap=aps[best_epoch],
+        original_completed_epochs=epochs, optimizer_state_reused=False,
+        source_compatibility=compatibility, files=hashes, source_binding=original)
 
 
 def preflight(args):
@@ -199,11 +309,24 @@ def preflight(args):
         raise ValueError('Training and validation batch sizes must be between 1 and 128')
     if not math.isfinite(args.sample_cache_gib) or not 0 <= args.sample_cache_gib <= 64:
         raise ValueError('Sample cache must be a finite budget from 0 to 64 GiB')
-    if args.epochs not in (2, 30) or args.phase not in ('det', 'diff'):
-        raise ValueError('Only the fixed 30-epoch recipe or isolated 2-epoch smoke is supported')
+    if not math.isfinite(args.p1_learning_rate) or args.p1_learning_rate <= 0:
+        raise ValueError('P1 learning rate must be finite and positive')
+    if not math.isfinite(args.h1_learning_rate) or args.h1_learning_rate <= 0:
+        raise ValueError('H1 learning rate must be finite and positive')
+    if (args.warm_start_h1_run is None) != (args.warm_start_h1_source_tree is None):
+        raise ValueError('Warm-start requires both the original run and source tree')
+    if args.epochs not in (2, 30, 60) or args.phase not in ('det', 'diff'):
+        raise ValueError('Only 30/60-epoch formal training or isolated 2-epoch smoke is supported')
+    budgets = dict(det=args.h1_epochs or args.epochs, diff=args.p1_epochs or args.epochs)
+    if (budgets[args.phase] != args.epochs or any(v not in (2, 30, 60) for v in budgets.values())
+            or (2 in budgets.values() and set(budgets.values()) != {2})):
+        raise ValueError('Explicit stage epoch budgets must match --epochs and use the same profile')
     root, run_root = args.data_root.resolve(), args.run_dir.resolve()
     if root == run_root or root in run_root.parents or run_root in root.parents:
         raise ValueError('Data and output directories must be disjoint')
+    external = args.warm_start_h1_run.resolve() if args.warm_start_h1_run is not None else None
+    if external is not None and (external == run_root or external in run_root.parents or run_root in external.parents):
+        raise ValueError('Original H1 and new training run directories must be disjoint')
     bundle_path = root / 'bundle.json'
     bundle = read_json(bundle_path)
     if (bundle.get('schema_version') != 'fwt_portable_data_bundle_v1'
@@ -226,7 +349,7 @@ def preflight(args):
     if counts != bundle['role_counts']:
         raise ValueError('Bundle role counts differ from actual metadata')
     _check_array_index(read_json(files['arrays_index']), manifest, root)
-    if args.epochs == 30:
+    if args.epochs >= 30:
         if counts != FULL_COUNTS or bundle.get('purpose') == 'smoke':
             raise ValueError('Formal training requires the complete 3197/811/568 development bundle')
         expected_ids = {r['sample_id'] for r in original['samples'] if r['role'] in DEVELOPMENT_ROLES}
@@ -236,7 +359,7 @@ def preflight(args):
         read_json(bound_file(root, bundle['original_normalizer'])), config, manifest,
         bundle['files']['weather']['sha256'])
     sources = PortableSources(files['weather'])
-    profile = 'formal' if args.epochs == 30 else 'smoke-2ep'
+    profile = 'formal' if args.epochs >= 30 else 'smoke-2ep'
     output = run_root / profile / args.phase
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise FileExistsError('Fresh phase output is required; choose a new --run-dir')
@@ -247,7 +370,18 @@ def preflight(args):
             p1_output_initialization='zero' if args.p1_zero_init else 'random'),
         performance=dict(sample_cache_gib=args.sample_cache_gib,
                          validation_batch_size=validation_batch_size, num_workers=0))
-    backbone = _check_own_det(run_root / profile / 'det', binding) if args.phase == 'diff' else None
+    if args.p1_learning_rate != RECIPE['learning_rate']:
+        binding['recipe']['p1_learning_rate'] = args.p1_learning_rate
+    if args.h1_learning_rate != RECIPE['learning_rate']:
+        binding['recipe']['h1_learning_rate'] = args.h1_learning_rate
+    if args.h1_epochs is not None or args.p1_epochs is not None:
+        binding['stage_epochs'] = budgets
+    backbone = None
+    if external is not None:
+        binding['warm_start_h1'] = _check_warm_start_det(external,
+            args.warm_start_h1_source_tree.resolve(), binding, manifest, config)
+    if args.phase == 'diff':
+        backbone = _check_own_det(run_root / profile / 'det', binding)
     return dict(schema_version='fwt_portable_preflight_v1', status='passed',
         phase=args.phase, profile=profile, training_started=False, heldout_evaluation=False,
         arrays_read=0, weights_deserialized=0, gpu_initialized=False,
@@ -281,7 +415,9 @@ def execute(args, checked):
     previous_root = artifacts.WORKSPACE
     artifacts.WORKSPACE = Path(checked['run_root'])
     train_args = SimpleNamespace(manifest=checked['manifest'], normalizer=checked['normalizer'],
-        output=checked['output'], epochs=args.epochs, batch_size=args.batch_size, learning_rate=.001,
+        output=checked['output'], epochs=args.epochs, batch_size=args.batch_size,
+        learning_rate=args.p1_learning_rate if args.phase == 'diff' else args.h1_learning_rate,
+        warm_start_h1=checked['binding'].get('warm_start_h1') if args.phase == 'det' else None,
         validation_batch_size=checked['binding']['performance']['validation_batch_size'],
         sample_cache_gib=args.sample_cache_gib,
         seed=0, device=args.device, loss='focal', samples=8, sampling_steps=4,
@@ -302,11 +438,17 @@ def execute(args, checked):
                 or diagnostic.get('completed_epochs') != args.epochs
                 or selection.get('selection_frozen') is not True):
             raise RuntimeError('Engine did not finish the requested frozen selection')
+        if 'warm_start_h1' in checked['binding']:
+            lineage = _check_warm_start_det(args.warm_start_h1_run.resolve(),
+                args.warm_start_h1_source_tree.resolve(), checked['binding'],
+                read_json(checked['manifest']), read_json(checked['config_path']))
+            if lineage != checked['binding']['warm_start_h1']:
+                raise RuntimeError('Original H1 lineage changed during training')
         names = ('best.pth', 'last.pth', 'selection.json', 'diagnostics.json',
                  'history.json', 'configuration.json', 'validation_selected.json')
         receipt = dict(schema_version='fwt_portable_training_completed_v1', status='completed',
             phase=args.phase, binding=checked['binding'],
-            smoke_only=args.epochs != 30, heldout_evaluation=False,
+            smoke_only=args.epochs == 2, heldout_evaluation=False,
             files={name: file_sha256(output / name) for name in names}, result=result)
         artifacts.atomic_json(output / 'portable_completed.json', receipt)
         return receipt
