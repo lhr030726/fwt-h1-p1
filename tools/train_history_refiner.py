@@ -75,7 +75,7 @@ def make_plan(args):
     # inheriting its continuation schedule, optimizer migration or output state.
     inherited_args = copy(args)
     inherited_args.resume_run, inherited_args.execute = None, False
-    inherited = previous.make_plan(inherited_args)
+    inherited = previous.make_plan(inherited_args, additional_source_files=('fwt_v2/history_refiner.py',))
     plan = {key: deepcopy(inherited[key]) for key in (
         'parent_run', 'parent_commit', 'parent_plan_sha256', 'parent_receipt_sha256',
         'parent_best_sha256', 'parent_model_sha256', 'parent_binding_sha256',

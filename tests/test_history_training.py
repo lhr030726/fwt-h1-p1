@@ -56,6 +56,26 @@ def advance(heads, optimizers, bindings, transaction, ap=.25):
 
 
 class HistoryTrainingTests(unittest.TestCase):
+    def test_parent_source_additions_are_explicit_and_cannot_change_frozen_files(self):
+        validate = runner.previous.validate_parent_source_files
+        original = {'fwt_v2/model.py': 'model-sha', 'tools/frozen.py': 'runner-sha'}
+        new_name = 'fwt_v2/history_refiner.py'
+        current = dict(original, **{new_name: 'new-history-sha'})
+        validate(original, original)
+        validate(original, current, (new_name,))
+        with self.assertRaises(ValueError):
+            validate(original, current)  # Default continuation contract remains exact.
+        with self.assertRaises(ValueError):
+            validate(original, {new_name: 'new-history-sha'}, (new_name,))
+        with self.assertRaises(ValueError):
+            validate(original, dict(current, **{'fwt_v2/model.py': 'changed'}), (new_name,))
+        with self.assertRaises(ValueError):
+            validate(original, dict(current, **{'fwt_v2/unapproved.py': 'extra'}), (new_name,))
+        with self.assertRaises(ValueError):
+            validate(original, original, (new_name,))  # A declared addition must actually exist.
+        with self.assertRaises(ValueError):
+            validate(original, original, ('fwt_v2/model.py',))
+
     def test_orders_cover_all_samples_without_consuming_global_rng(self):
         ids = [str(index) for index in range(811)]
         before = torch.get_rng_state().clone()

@@ -125,7 +125,23 @@ def validate_diagnostic(path, parent_best):
     return report, files
 
 
-def make_plan(args):
+def validate_parent_source_files(expected, current, additional_source_files=()):
+    """Preserve every frozen source digest while allowing only named additions.
+
+    Existing continuation callers retain exact-set comparison by default. A
+    downstream experiment may explicitly declare new modules discovered by the
+    shared source inventory; it may not omit or change any historical file.
+    """
+    allowed = set(additional_source_files)
+    require(len(allowed) == len(additional_source_files) and not allowed.intersection(expected),
+            'Additional source allowlist must contain unique new filenames')
+    require(set(current) == set(expected) | allowed,
+            'Frozen parent source missing or unapproved additional source present')
+    require(all(current[name] == digest for name, digest in expected.items()),
+            'Frozen parent source digest differs')
+
+
+def make_plan(args, *, additional_source_files=()):
     parent_path = args.parent_run / 'plan.json'
     parent = read_json(parent_path)
     receipt = read_json(args.parent_run / 'receipt.json')
@@ -136,7 +152,7 @@ def make_plan(args):
             and receipt.get('schema') == 'fwt_literature_extension_completed_v1'
             and receipt.get('status') == 'completed' and receipt.get('completed_epochs') == 50
             and receipt.get('plan_sha256') == sha(parent_path), 'Require completed original fifty-epoch parent')
-    require(parent['source_files'] == extension.source_files(), 'Frozen parent source differs')
+    validate_parent_source_files(parent['source_files'], extension.source_files(), additional_source_files)
     parent_root = args.parent_run.parent.parent
     files = dict(parent['input_files_sha256'])
     files.update({str(parent_root / name): value for name, value in parent['source_files'].items()})
