@@ -132,11 +132,12 @@ class RCDADecoder(nn.Module):
             self.decoders.append(conv_block(lower * 2, lower))
         self.Conv_1x1 = nn.Conv2d(widths[0], 1, 1)
 
-    def decode(self, pyramid):
+    def decode(self, pyramid, *, return_decoder_features=False):
         x = pyramid[-1]
         for index, up in enumerate(self.upsamples):
             skip = pyramid[-2 - index]
             x_up = up(x, skip.shape[-2:])
             attended = self.attentions[index](x_up, skip)
             x = self.decoders[index](torch.cat([attended, x_up], dim=1))
-        return self.Conv_1x1(x)
+        logits = self.Conv_1x1(x)
+        return (logits, x) if return_decoder_features else logits

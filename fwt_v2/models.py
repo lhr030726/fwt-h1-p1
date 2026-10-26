@@ -130,7 +130,9 @@ class FWTDet(RCDADecoder):
         if (physics["slope"] < 0).any():
             raise ValueError("physical slope magnitude must be nonnegative")
 
-    def forward(self, x_norm, physics, modality_mask=None):
+    def forward(self, x_norm, physics, modality_mask=None, *, return_decoder_features=False):
+        if not isinstance(return_decoder_features, bool):
+            raise ValueError("return_decoder_features must be a boolean")
         self._validate_inputs(x_norm, physics)
         if modality_mask is None:
             modality_mask = sample_modality_mask(
@@ -167,10 +169,17 @@ class FWTDet(RCDADecoder):
                 lowres["upslope_xy"])
             # beta=0 makes this entire skip update exactly zero at initialization.
             fused_pyramid[2] = fused_pyramid[2] + self.prop_expand(relational_feature - compressed)
-        return {"logits_det": self.decode(fused_pyramid),
-                "fused_pyramid": fused_pyramid, "relational_feature": relational_feature,
-                "gate_weights": gate_weights, "direction_weights": direction_weights,
-                "modality_mask": modality_mask}
+        if return_decoder_features:
+            logits, decoder_feature = self.decode(fused_pyramid, return_decoder_features=True)
+        else:
+            logits = self.decode(fused_pyramid)
+        outputs = {"logits_det": logits, "fused_pyramid": fused_pyramid,
+                   "relational_feature": relational_feature,
+                   "gate_weights": gate_weights, "direction_weights": direction_weights,
+                   "modality_mask": modality_mask}
+        if return_decoder_features:
+            outputs["decoder_feature"] = decoder_feature
+        return outputs
 
 
 class RCDABaseline(RCDADecoder):
